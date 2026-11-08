@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "quant",
+    deps = [
+       "//include:quant_lib",
+    ],
+    
+    srcs = [
+        "quant.cpp"
+    ],
+    copts = [
+        "-std=c++20",
+        "-O3",
+        "-march=native",
+    ],
+)
