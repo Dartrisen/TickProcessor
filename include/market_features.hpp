@@ -1,71 +1,48 @@
-#include <algorithm>
+#pragma once
+
+#include "dataset.hpp"
+
 #include <cmath>
-#include <cstdint>
-#include <fstream>
-#include <iostream>
-#include <limits>
-#include <span>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
-// ============================================================
-// Market feature extraction
-// ============================================================
+struct DerivedFeatures
+{
+    double log_return{0.0};
+    double simple_return{0.0};
+    double rolling_volatility{0.0};
+    double volume_ratio{0.0};
+};
 
-class MarketFeatures {
+class MarketFeatures
+{
 public:
-  // Logarithmic returns:
-  //
-  // r[i] = log(P[i] / P[i-1])
+    static std::vector<double> log_returns(const MarketDataset& data)
+    {
+        if (data.size() < 2)
+            return {};
 
-  static std::vector<double> log_returns(const MarketDataset &data) {
+        std::vector<double> returns;
+        returns.reserve(data.size() - 1);
 
-    std::vector<double> returns;
-
-    if (data.size() < 2) {
-      return returns;
+        for (std::size_t i = 1; i < data.size(); ++i)
+        {
+            returns.push_back(std::log(data[i].close / data[i - 1].close));
+        }
+        return returns;
     }
 
-    returns.reserve(data.size() - 1);
+    static std::vector<double> simple_returns(const MarketDataset& data)
+    {
+        if (data.size() < 2)
+            return {};
 
-    for (std::size_t i = 1; i < data.size(); ++i) {
+        std::vector<double> returns;
+        returns.reserve(data.size() - 1);
 
-      const double p0 = data[i - 1].close;
-      const double p1 = data[i].close;
-
-      returns.push_back(std::log(p1 / p0));
+        for (std::size_t i = 1; i < data.size(); ++i)
+        {
+            returns.push_back((data[i].close / data[i - 1].close) - 1.0);
+        }
+        return returns;
     }
-
-    return returns;
-  }
-
-  // Simple returns:
-  //
-  // r[i] = P[i] / P[i-1] - 1
-
-  static std::vector<double> simple_returns(const MarketDataset &data) {
-
-    std::vector<double> returns;
-
-    if (data.size() < 2) {
-      return returns;
-    }
-
-    returns.reserve(data.size() - 1);
-
-    for (std::size_t i = 1; i < data.size(); ++i) {
-
-      const double p0 = data[i - 1].close;
-      const double p1 = data[i].close;
-
-      returns.push_back(p1 / p0 - 1.0);
-    }
-
-    return returns;
-  }
 };

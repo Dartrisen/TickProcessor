@@ -1,0 +1,75 @@
+Language: Cpp
+
+# Base style
+BasedOnStyle: LLVM
+
+# Indentation
+IndentWidth: 4
+ContinuationIndentWidth: 8
+TabWidth: 4
+UseTab: Never
+
+# Line length
+ColumnLimit: 180
+
+# Braces
+BreakBeforeBraces: Allman
+
+# Functions
+AllowShortFunctionsOnASingleLine: Empty
+AlwaysBreakTemplateDeclarations: Yes
+
+# Control statements
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Classes / structs
+AccessModifierOffset: -4
+EmptyLineBeforeAccessModifier: LogicalBlock
+
+# Includes
+SortIncludes: true
+IncludeBlocks: Regroup
+
+# Alignment
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AlignOperands: true
+AlignTrailingComments: true
+
+# Pointers / references
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Spaces
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+SpacesInContainerLiterals: false
+SpaceAfterCStyleCast: true
+
+# Templates
+AlwaysBreakAfterReturnType: None
+PenaltyBreakTemplateDeclaration: 0
+
+# Constructor formatting
+BreakConstructorInitializersBeforeComma: false
+ConstructorInitializerIndentWidth: 8
+
+# Namespace formatting
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# Switches
+IndentCaseLabels: true
+
+# Modern C++
+Standard: Latest
+Cpp11BracedListStyle: true
+
+# Empty lines
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+# Misc
+ReflowComments: false
+SortUsingDeclarations: true
