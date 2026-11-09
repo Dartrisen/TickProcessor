@@ -1,65 +1,58 @@
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <fstream>
+#include "include/csv_reader.hpp"
+#include "include/kinetic_model.hpp"
+#include "include/tick_processor.hpp"
+
 #include <iostream>
-#include <limits>
-#include <span>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <utility>
+#include <memory>
 #include <vector>
 
-#include "include/csv_reader.hpp"
-#include "include/market_features.hpp"
+int main()
+{
+    try
+    {
+        // setup online tick streaming processor
+        TickProcessor                processor(10); // 10-period rolling volatility window
+        std::vector<DerivedFeatures> feature_stream;
 
-// ============================================================
-// Main
-// ============================================================
+        processor.register_callback([&](const Tick& /*t*/, const DerivedFeatures& f) { feature_stream.push_back(f); });
 
-int main() {
+        // load market data
+        auto market = CsvReader::load("/Users/cdg546/Downloads/data/SPY_clean_1min.csv");
+        std::cout << "Successfully loaded " << market.size() << " market ticks.\n";
 
-  try {
+        // Stream ticks through online processor
+        for (const auto& tick : market.bars())
+        {
+            processor.process(tick);
+        }
 
-    // Load historical data
-    auto market =
-        CsvReader::load("/Users/cdg546/Downloads/data/SPY_clean_1min.csv");
+        // initialize kinetic model with default empirical transition kernel
+        std::size_t bins  = 20;
+        double      x_max = 0.05; // +/- 5% return range
 
-    std::cout << "Loaded observations: " << market.size() << "\n\n";
+        KineticModel model(bins, x_max, std::make_unique<EmpiricalKernel>());
+        model.fit(feature_stream);
 
-    // Inspect first observations
-    const std::size_t count = std::min<std::size_t>(5, market.size());
+        std::cout << "\n[Model 1] Fitted Empirical Kinetic Model successfully across " << bins << " state space bins.\n";
 
-    for (std::size_t i = 0; i < count; ++i) {
+        //eEvolve an initial state distribution
+        auto f_t0 = model.initial_distribution();
+        auto f_t1 = model.evolve(f_t0);
+        std::cout << "Evolved state vector (bin 10 center): " << f_t1[10] << "\n";
 
-      const auto &bar = market[i];
+        // dynamically swap kernel to gaussian diffusion model
+        std::cout << "\n--> Swapping Model Kernel to Parametric Gaussian Diffusion Kernel...\n";
+        model.set_kernel(std::make_unique<GaussianDiffusionKernel>(0.0001, 0.005));
+        model.fit(feature_stream);
 
-      std::cout << bar.datetime << " | Open: " << bar.open
-                << " | High: " << bar.high << " | Low: " << bar.low
-                << " | Close: " << bar.close << " | Volume: " << bar.volume
-                << " | Source: " << bar.source << "\n";
+        auto f_t1_gaussian = model.evolve(f_t0);
+        std::cout << "[Model 2] Evolved state vector with Gaussian Kernel (bin 10 center): " << f_t1_gaussian[10] << "\n";
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Execution Exception: " << e.what() << "\n";
+        return 1;
     }
 
-    // Extract features
-    auto returns = MarketFeatures::log_returns(market);
-
-    std::cout << "\nLog returns: " << returns.size() << "\n";
-
-    const std::size_t return_count = std::min<std::size_t>(5, returns.size());
-
-    for (std::size_t i = 0; i < return_count; ++i) {
-      std::cout << returns[i] << "\n";
-    }
-
-  } catch (const std::exception &e) {
-
-    std::cerr << "Error: " << e.what() << "\n";
-
-    return 1;
-  }
-
-  return 0;
+    return 0;
 }
