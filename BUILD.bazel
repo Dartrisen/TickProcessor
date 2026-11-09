@@ -5,7 +5,6 @@ cc_binary(
     deps = [
        "//include:quant_lib",
     ],
-    
     srcs = [
         "quant.cpp"
     ],

@@ -5,13 +5,10 @@ cc_library(
     hdrs = [
         "csv_reader.hpp",
         "dataset.hpp",
-        "tick.hpp",
+        "kinetic_model.hpp",
         "market_features.hpp",
-    ],
-    copts = [
-        "-std=c++20",
-        "-O3",
-        "-march=native",
+        "tick.hpp",
+        "tick_processor.hpp",
     ],
     visibility = ["//visibility:public"],
 )
