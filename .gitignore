@@ -23,11 +23,6 @@
 *.dll
 *.so.*
 
-
-# Fortran module files
-*.mod
-*.smod
-
 # Compiled Static libraries
 *.lai
 *.la
@@ -43,14 +38,10 @@
 build/
 Build/
 build-*/
+bazel-*
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
+# Bazel generated files
+MODULE.bazel.lock
 
 # Temporary files
 *.tmp
