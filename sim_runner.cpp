@@ -28,17 +28,16 @@ int main()
     {
         QuantConsoleReporter::render_header("LIVE API BACKTEST & PAPER TRADING SIMULATION ENGINE");
 
-        // configure exchange simulation & fee model (Alpaca/IBKR)
-        FeeStructure alpaca_fees{
-                .commission_rate     = 0.0001, // 0.01% fee (1 bps)
-                .fixed_fee_per_trade = 0.00,   // $0.00 per trade
-                .slippage_bps        = 0.0001  // 1 bps execution slippage
-        };
-        double            initial_cash = 10000.0; // $10,000 starting account
-        SimulatedExchange exchange(initial_cash, alpaca_fees);
+        // load all hyper-parameters, risk limits, and fee structures from quant.env
+        EngineConfig cfg = ConfigLoader::load("quant.env");
 
-        // load historical market CSV ticks
-        std::string data_path = "/Users/cdg546/Downloads/data/SPY_clean_1min.csv";
+        // configure exchange simulation & fee model from config
+        FeeStructure      fees{.commission_rate = cfg.commission_rate, .fixed_fee_per_trade = cfg.fixed_fee, .slippage_bps = cfg.slippage_bps};
+        double            initial_cash = cfg.initial_capital;
+        SimulatedExchange exchange(initial_cash, fees);
+
+        // load historical market csv ticks using configured data path
+        std::string data_path = cfg.data_path;
         std::cout << "[+] Connecting to simulated market feed: " << QuantConsoleReporter::CYAN << data_path << QuantConsoleReporter::RESET << " ...\n";
 
         MarketDataset                market;
@@ -60,34 +59,14 @@ int main()
         }
         catch (const std::exception&)
         {
-            std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing. Generating synthetic high-frequency price feed...\n" << QuantConsoleReporter::RESET;
-            Tick synth_tick;
-            synth_tick.close  = 400.0;
-            synth_tick.volume = 1000;
-            OnlineFeatureEngine<20> feature_prepass;
-            DerivedFeatures         feat{};
-
-            for (std::size_t i = 0; i < 600; ++i)
-            {
-                synth_tick.datetime = "2026-03-31 09:" + std::to_string(i / 60) + ":" + std::to_string(i % 60);
-                double ret          = 0.0008 * std::sin(static_cast<double>(i) * 0.15) + ((i % 7 == 0) ? 0.002 : -0.0005);
-                synth_tick.close *= (1.0 + ret);
-                synth_tick.open = synth_tick.close;
-                synth_tick.high = synth_tick.close * 1.0005;
-                synth_tick.low  = synth_tick.close * 0.9995;
-                market.add(synth_tick);
-
-                if (feature_prepass.process(synth_tick, feat))
-                {
-                    historical_features.push_back(feat);
-                }
-            }
+            std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing. Please provide a valid data file path in `quant.env`.\n" << QuantConsoleReporter::RESET;
+            return 1;
         }
 
         std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << market.size() << QuantConsoleReporter::RESET << " market ticks into live feed simulator.\n";
 
         // setup kinetic strategy engine & calibrate baseline kernel
-        double        x_max = 0.015;
+        double        x_max = cfg.x_max;
         KineticEngine engine(x_max);
         auto          kernel = std::make_unique<Matrix>();
 
@@ -95,9 +74,9 @@ int main()
         empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *kernel);
         engine.update_kernel(kernel.get());
 
-        // live pipeline components
+        // live pipeline components initialized with configured risk limits
         OnlineFeatureEngine<20>    hot_feature_engine;
-        RiskEngine                 risk_engine;
+        RiskEngine                 risk_engine(cfg.risk_limits);
         KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
         KineticEngine::StateVector next_distribution{};
         DerivedFeatures            feat{};
@@ -119,10 +98,10 @@ int main()
                 QuantForecast  forecast = engine.analyze_and_predict(tick.close, next_distribution);
                 SignalDecision decision = risk_engine.evaluate(forecast);
 
-                // route signal to simulated order gateway
+                // route signal to simulated order gateway with configured position allocation %
                 if (decision.signal == OrderSignal::Buy || decision.signal == OrderSignal::Sell)
                 {
-                    ExecutionFill fill = exchange.execute_order(decision.signal, tick.datetime, tick.close, 0.95);
+                    ExecutionFill fill = exchange.execute_order(decision.signal, tick.datetime, tick.close, cfg.allocation_pct);
                     if (fill.shares > 0.0)
                     {
                         const char* tag = (fill.side == OrderSignal::Buy) ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;

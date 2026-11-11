@@ -24,6 +24,9 @@ cc_binary(
         "-O3",
         "-march=native",
     ],
+    data = [
+        "//:quant.env",
+    ],
     deps = [
         "//include/quant:quant_lib",
     ],
