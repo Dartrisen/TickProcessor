@@ -3,6 +3,7 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "quant_lib",
     hdrs = [
+        "core/config.hpp",
         "core/matrix.hpp",
         "core/ring_buffer.hpp",
         "core/types.hpp",
