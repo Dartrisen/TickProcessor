@@ -10,7 +10,7 @@ cc_library(
         "data/csv_reader.hpp",
         "features/feature_engine.hpp",
         "features/online_stats.hpp",
-        "models/empirical_kernel.hpp",
+        "models/kernels.hpp",
         "models/interfaces.hpp",
         "models/kinetic_model.hpp",
         "risk/risk_manager.hpp",

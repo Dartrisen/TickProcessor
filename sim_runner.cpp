@@ -5,7 +5,7 @@
 #include "quant/data/csv_reader.hpp"
 #include "quant/execution/simulated_exchange.hpp"
 #include "quant/features/feature_engine.hpp"
-#include "quant/models/empirical_kernel.hpp"
+#include "quant/models/kernels.hpp"
 #include "quant/models/kinetic_model.hpp"
 #include "quant/risk/risk_manager.hpp"
 #include "quant/telemetry/console_reporter.hpp"
@@ -80,9 +80,9 @@ int main()
         KineticEngine engine(x_max);
         auto          kernel = std::make_unique<Matrix>();
 
-        // Swap to MultiStepPropagatorKernel or InertialAntiChurnKernel here if desired
-        EmpiricalKernel<BINS> empirical_builder;
-        empirical_builder.build_kernel(engine.dx(), engine.x_max(), train_features, *kernel);
+        // EmpiricalKernel/SpatialSmoothedKernel
+        EmpiricalKernel<BINS> kernel_builder;
+        kernel_builder.build_kernel(engine.dx(), engine.x_max(), train_features, *kernel);
         engine.update_kernel(kernel.get());
 
         // ---------------------------------------------------------------------
