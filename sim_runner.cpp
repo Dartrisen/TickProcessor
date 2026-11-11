@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -28,34 +29,19 @@ int main()
     {
         QuantConsoleReporter::render_header("LIVE API BACKTEST & PAPER TRADING SIMULATION ENGINE");
 
-        // load all hyper-parameters, risk limits, and fee structures from quant.env
         EngineConfig cfg = ConfigLoader::load("quant.env");
 
-        // configure exchange simulation & fee model from config
         FeeStructure      fees{.commission_rate = cfg.commission_rate, .fixed_fee_per_trade = cfg.fixed_fee, .slippage_bps = cfg.slippage_bps};
         double            initial_cash = cfg.initial_capital;
         SimulatedExchange exchange(initial_cash, fees);
 
-        // load historical market csv ticks using configured data path
         std::string data_path = cfg.data_path;
         std::cout << "[+] Connecting to simulated market feed: " << QuantConsoleReporter::CYAN << data_path << QuantConsoleReporter::RESET << " ...\n";
 
-        MarketDataset                market;
-        std::vector<DerivedFeatures> historical_features;
+        MarketDataset market;
         try
         {
             market = CsvReader::load(data_path);
-            historical_features.reserve(market.size());
-
-            OnlineFeatureEngine<20> feature_prepass;
-            DerivedFeatures         feat{};
-            for (const auto& tick : market.bars())
-            {
-                if (feature_prepass.process(tick, feat))
-                {
-                    historical_features.push_back(feat);
-                }
-            }
         }
         catch (const std::exception&)
         {
@@ -65,27 +51,55 @@ int main()
 
         std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << market.size() << QuantConsoleReporter::RESET << " market ticks into live feed simulator.\n";
 
-        // setup kinetic strategy engine & calibrate baseline kernel
+        // ---------------------------------------------------------------------
+        // IN-SAMPLE TRAINING PHASE (First 30% of data ONLY)
+        // ---------------------------------------------------------------------
+        std::size_t total_bars = market.size();
+        std::size_t train_size = static_cast<std::size_t>(total_bars * 0.30); // Use 30% for training
+        std::size_t test_size  = total_bars - train_size;
+
+        std::vector<DerivedFeatures> train_features;
+        train_features.reserve(train_size);
+
+        OnlineFeatureEngine<20> train_fe;
+        DerivedFeatures         feat{};
+
+        for (std::size_t i = 0; i < train_size; ++i)
+        {
+            if (train_fe.process(market[i], feat))
+            {
+                train_features.push_back(feat);
+            }
+        }
+
+        std::cout << "[+] Calibrating transition kernel on " << QuantConsoleReporter::BOLD << train_features.size() << QuantConsoleReporter::RESET
+                  << " IN-SAMPLE training bars...\n";
+
+        // Build kernel STRICTLY from in-sample training features
         double        x_max = cfg.x_max;
         KineticEngine engine(x_max);
         auto          kernel = std::make_unique<Matrix>();
 
+        // Swap to MultiStepPropagatorKernel or InertialAntiChurnKernel here if desired
         EmpiricalKernel<BINS> empirical_builder;
-        empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *kernel);
+        empirical_builder.build_kernel(engine.dx(), engine.x_max(), train_features, *kernel);
         engine.update_kernel(kernel.get());
 
-        // live pipeline components initialized with configured risk limits
+        // ---------------------------------------------------------------------
+        // OUT-OF-SAMPLE TRADING PHASE (Remaining 70% of data)
+        // ---------------------------------------------------------------------
         OnlineFeatureEngine<20>    hot_feature_engine;
         RiskEngine                 risk_engine(cfg.risk_limits);
         KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
         KineticEngine::StateVector next_distribution{};
-        DerivedFeatures            feat{};
 
         QuantConsoleReporter::render_header("SIMULATED ORDER GATEWAY & LIVE TRADE EXECUTION STREAM");
+        std::cout << "[+] Trading OUT-OF-SAMPLE on remaining " << test_size << " market ticks...\n";
 
-        // run live feed tick processing & execution loop
-        for (const auto& tick : market.bars())
+        for (std::size_t i = train_size; i < total_bars; ++i)
         {
+            const auto& tick = market[i];
+
             if (hot_feature_engine.process(tick, feat))
             {
                 std::size_t state_idx = engine.state_index(feat.log_return);
