@@ -14,6 +14,7 @@ cc_library(
         "models/kinetic_model.hpp",
         "risk/risk_manager.hpp",
         "telemetry/console_reporter.hpp",
+        "execution/simulated_exchange.hpp",
     ],
     includes = ["../../include"],
     visibility = ["//visibility:public"],

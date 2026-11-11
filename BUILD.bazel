@@ -14,3 +14,17 @@ cc_binary(
         "-march=native",
     ],
 )
+
+# new live API simulation & backtest executable
+cc_binary(
+    name = "sim_runner",
+    srcs = ["sim_runner.cpp"],
+    copts = [
+        "-std=c++20",
+        "-O3",
+        "-march=native",
+    ],
+    deps = [
+        "//include/quant:quant_lib",
+    ],
+)
