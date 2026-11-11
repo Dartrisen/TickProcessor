@@ -35,7 +35,7 @@ int main()
 
         // Cold path historical ingestion
         std::string data_path = "/Users/cdg546/Downloads/data/SPY_clean_1min.csv";
-        std::cout << "[+] Ingesting historical market ticks from: " << data_path << " ...\n";
+        std::cout << "[+] Ingesting historical market ticks from: " << QuantConsoleReporter::CYAN << data_path << QuantConsoleReporter::RESET << " ...\n";
 
         MarketDataset                market;
         std::vector<DerivedFeatures> historical_features;
@@ -56,7 +56,7 @@ int main()
         }
         catch (const std::exception&)
         {
-            std::cout << "[!] CSV missing/unreadable. Initializing synthetic market dataset...\n";
+            std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing/unreadable. Initializing synthetic market dataset...\n" << QuantConsoleReporter::RESET;
             for (std::size_t i = 0; i < 500; ++i)
             {
                 double ret = 0.001 * std::sin(static_cast<double>(i) * 0.1);
@@ -64,7 +64,8 @@ int main()
             }
         }
 
-        std::cout << "[+] Extracted " << historical_features.size() << " feature frames for background matrix calibration.\n";
+        std::cout << "[+] Extracted " << QuantConsoleReporter::BOLD << historical_features.size() << QuantConsoleReporter::RESET
+                  << " feature frames for background matrix calibration.\n";
 
         // Baseline startup calibration & atomic kernel load
         EmpiricalKernel<BINS> empirical_builder;
@@ -80,6 +81,12 @@ int main()
 
         std::atomic<bool>        running{true};
         std::atomic<std::size_t> processed_ticks{0};
+
+        // Telemetry counters
+        std::size_t count_buys{0};
+        std::size_t count_sells{0};
+        std::size_t count_holds{0};
+        std::size_t count_risk_vetoes{0};
 
         // Async Background Calibration Thread (Warm Path)
         std::thread calibration_thread(
@@ -105,7 +112,7 @@ int main()
         DerivedFeatures            feat{};
         double                     last_price = market.empty() ? 400.0 : market.bars().back().close;
 
-        std::cout << "\n[+] Starting Real-Time Execution Engine Hot Path...\n";
+        QuantConsoleReporter::render_header("LIVE SIGNAL ANALYSIS & PRE-TRADE RISK STREAM");
 
         for (const auto& tick : market.bars())
         {
@@ -124,10 +131,26 @@ int main()
                     engine.evolve(current_distribution, next_distribution);
 
                     // Pre-Trade Risk Filtering & Signal Dispatch
-                    QuantForecast forecast = engine.analyze_and_predict(dequeued_tick.close, next_distribution);
-                    OrderSignal   signal   = risk_engine.evaluate(forecast);
+                    QuantForecast  forecast = engine.analyze_and_predict(dequeued_tick.close, next_distribution);
+                    SignalDecision decision = risk_engine.evaluate(forecast);
 
-                    (void) signal; // Dispatched to order execution gateway
+                    // Update signal telemetry statistics
+                    if (decision.signal == OrderSignal::Buy)
+                        count_buys++;
+                    else if (decision.signal == OrderSignal::Sell)
+                        count_sells++;
+                    else
+                        count_holds++;
+
+                    if (decision.risk_veto)
+                        count_risk_vetoes++;
+
+                    // Log active trade signals (BUY / SELL) or risk vetoes
+                    if (decision.signal != OrderSignal::Hold || decision.risk_veto)
+                    {
+                        QuantConsoleReporter::print_signal_event(dequeued_tick.datetime, dequeued_tick.close, decision, forecast);
+                    }
+
                     processed_ticks.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -139,19 +162,20 @@ int main()
             calibration_thread.join();
         }
 
-        std::cout << "[+] Hot Path processed " << processed_ticks.load() << " market ticks with zero heap allocation.\n";
+        // Output complete trading execution telemetry summary
+        QuantConsoleReporter::print_execution_summary(processed_ticks.load(), count_buys, count_sells, count_holds, count_risk_vetoes);
 
-        // Display rollout telemetry
+        // Display final step rollout forecast
         KineticEngine::StateVector forecast_pdf{};
         engine.evolve(current_distribution, forecast_pdf);
         QuantForecast final_forecast = engine.analyze_and_predict(last_price, forecast_pdf);
 
         QuantConsoleReporter::print_forecast(final_forecast, 1);
-        QuantConsoleReporter::print_distribution_ascii(engine.dx(), engine.x_max(), forecast_pdf, "Hot Path State Density f(t+1)");
+        QuantConsoleReporter::print_distribution_ascii(engine.dx(), engine.x_max(), forecast_pdf, "Hot Path Final State Density f(t+1)");
     }
     catch (const std::exception& e)
     {
-        std::cerr << "Fatal Exception: " << e.what() << "\n";
+        std::cerr << QuantConsoleReporter::RED << "Fatal Exception: " << e.what() << QuantConsoleReporter::RESET << "\n";
         return 1;
     }
 
