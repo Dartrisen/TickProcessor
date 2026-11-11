@@ -1,3 +1,4 @@
+#include "quant/core/config.hpp"
 #include "quant/core/matrix.hpp"
 #include "quant/core/ring_buffer.hpp"
 #include "quant/core/types.hpp"
@@ -25,16 +26,19 @@ int main()
     {
         QuantConsoleReporter::render_header("DUAL-SPEED KINETIC QUANTITATIVE TRADING ENGINE");
 
-        // Double-buffered transition kernels owned by warm path calibration worker thread
+        // load runtime configuration parameters from config loader
+        EngineConfig cfg = ConfigLoader::load("quant.env");
+
+        // double-buffered transition kernels owned by warm path calibration worker thread
         auto kernel_primary   = std::make_unique<Matrix>();
         auto kernel_secondary = std::make_unique<Matrix>();
 
-        // Kinetic Hot Path engine
-        double        x_max = 0.015; // +/- 1.5% max return window
+        // kinetic hot path engine initialized with config return window
+        double        x_max = cfg.x_max;
         KineticEngine engine(x_max);
 
-        // Cold path historical ingestion
-        std::string data_path = "/Users/cdg546/Downloads/data/SPY_clean_1min.csv";
+        // cold path historical ingestion from configured data path
+        std::string data_path = cfg.data_path;
         std::cout << "[+] Ingesting historical market ticks from: " << QuantConsoleReporter::CYAN << data_path << QuantConsoleReporter::RESET << " ...\n";
 
         MarketDataset                market;
@@ -67,46 +71,46 @@ int main()
         std::cout << "[+] Extracted " << QuantConsoleReporter::BOLD << historical_features.size() << QuantConsoleReporter::RESET
                   << " feature frames for background matrix calibration.\n";
 
-        // Baseline startup calibration & atomic kernel load
+        // baseline startup calibration & atomic kernel load
         EmpiricalKernel<BINS> empirical_builder;
         empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *kernel_primary);
         engine.update_kernel(kernel_primary.get());
 
         QuantConsoleReporter::print_transition_matrix(*kernel_primary, 8);
 
-        // Lock-Free SPSC Ring Buffer for Live Hot Path Pipeline
+        // lock-free spsc ring buffer for live hot path pipeline
         SPSCRingBuffer<Tick, 1024> tick_queue;
         OnlineFeatureEngine<20>    hot_feature_engine;
-        RiskEngine                 risk_engine;
+        RiskEngine                 risk_engine(cfg.risk_limits);
 
         std::atomic<bool>        running{true};
         std::atomic<std::size_t> processed_ticks{0};
 
-        // Telemetry counters
+        // telemetry counters
         std::size_t count_buys{0};
         std::size_t count_sells{0};
         std::size_t count_holds{0};
         std::size_t count_risk_vetoes{0};
 
-        // Async Background Calibration Thread (Warm Path)
+        // async background calibration thread (warm path) using configured calibration frequency
         std::thread calibration_thread(
                 [&]()
                 {
                     bool use_primary = false;
                     while (running.load(std::memory_order_relaxed))
                     {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(cfg.async_calibration_ms));
 
                         Matrix* next_kernel = use_primary ? kernel_primary.get() : kernel_secondary.get();
                         empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *next_kernel);
 
-                        // Lock-free release-acquire atomic matrix pointer swap
+                        // lock-free release-acquire atomic matrix pointer swap
                         engine.update_kernel(next_kernel);
                         use_primary = !use_primary;
                     }
                 });
 
-        // Hot Path Execution Loop
+        // hot path execution loop
         KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
         KineticEngine::StateVector next_distribution{};
         DerivedFeatures            feat{};
@@ -121,20 +125,20 @@ int main()
             Tick dequeued_tick;
             if (tick_queue.pop(dequeued_tick))
             {
-                // Incremental feature processing
+                // incremental feature processing
                 if (hot_feature_engine.process(dequeued_tick, feat))
                 {
                     std::size_t state_idx = engine.state_index(feat.log_return);
                     current_distribution  = engine.state_delta(state_idx);
 
-                    // O(N^2) forward density evolution
+                    // forward density evolution
                     engine.evolve(current_distribution, next_distribution);
 
-                    // Pre-Trade Risk Filtering & Signal Dispatch
+                    // pre-trade risk filtering & signal dispatch
                     QuantForecast  forecast = engine.analyze_and_predict(dequeued_tick.close, next_distribution);
                     SignalDecision decision = risk_engine.evaluate(forecast);
 
-                    // Update signal telemetry statistics
+                    // update signal telemetry statistics
                     if (decision.signal == OrderSignal::Buy)
                         count_buys++;
                     else if (decision.signal == OrderSignal::Sell)
@@ -145,7 +149,7 @@ int main()
                     if (decision.risk_veto)
                         count_risk_vetoes++;
 
-                    // Log active trade signals (BUY / SELL) or risk vetoes
+                    // log active trade signals (buy / sell) or risk vetoes
                     if (decision.signal != OrderSignal::Hold || decision.risk_veto)
                     {
                         QuantConsoleReporter::print_signal_event(dequeued_tick.datetime, dequeued_tick.close, decision, forecast);
@@ -162,10 +166,10 @@ int main()
             calibration_thread.join();
         }
 
-        // Output complete trading execution telemetry summary
+        // output complete trading execution telemetry summary
         QuantConsoleReporter::print_execution_summary(processed_ticks.load(), count_buys, count_sells, count_holds, count_risk_vetoes);
 
-        // Display final step rollout forecast
+        // display final step rollout forecast
         KineticEngine::StateVector forecast_pdf{};
         engine.evolve(current_distribution, forecast_pdf);
         QuantForecast final_forecast = engine.analyze_and_predict(last_price, forecast_pdf);
