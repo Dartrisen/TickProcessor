@@ -1,7 +1,9 @@
 #pragma once
 
-#include "kinetic_model.hpp"
+#include "quant/core/matrix.hpp"
+#include "quant/models/interfaces.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -35,19 +37,22 @@ public:
         std::cout << "+------------------------------------------------------------------------------------------------------+\n";
     }
 
-    static void print_distribution_ascii(const KineticModel& model, const KineticModel::Distribution& dist, const std::string& label)
+    template <std::size_t Bins>
+    static void print_distribution_ascii(double dx, double x_max, const std::array<double, Bins>& dist, const std::string& label)
     {
         std::cout << "\n--- Density Distribution: " << label << " ---\n";
         constexpr std::size_t max_bar_width = 40;
 
         double max_p = 0.0;
         for (double p : dist)
+        {
             if (p > max_p)
                 max_p = p;
+        }
 
-        for (std::size_t i = 0; i < model.bins(); ++i)
+        for (std::size_t i = 0; i < Bins; ++i)
         {
-            double center  = model.bin_center(i);
+            double center  = -x_max + (static_cast<double>(i) + 0.5) * dx;
             double prob    = dist[i];
             auto   bar_len = static_cast<std::size_t>((prob / (max_p > 0 ? max_p : 1.0)) * max_bar_width);
 
@@ -57,10 +62,10 @@ public:
         }
     }
 
-    static void print_transition_matrix(const KineticModel& model, std::size_t max_display_bins = 8)
+    template <std::size_t Bins>
+    static void print_transition_matrix(const FlatMatrix<double, Bins>& W, std::size_t max_display_bins = 8)
     {
-        std::size_t bins = std::min(model.bins(), max_display_bins);
-        const auto& W    = model.transition_matrix();
+        std::size_t bins = std::min(Bins, max_display_bins);
 
         std::cout << "\n--- Dynamic Transition Kernel Matrix W(i -> j) (First " << bins << "x" << bins << " state subset) ---\n";
         std::cout << "       ";
@@ -75,7 +80,7 @@ public:
             std::cout << "Bin" << std::setw(2) << i << " |";
             for (std::size_t j = 0; j < bins; ++j)
             {
-                double val = W[i * model.bins() + j];
+                double val = W(i, j);
                 std::cout << std::right << std::setw(7) << std::fixed << std::setprecision(3) << val;
             }
             std::cout << "\n";

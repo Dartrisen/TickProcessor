@@ -18,3 +18,11 @@ struct Tick
         return (high + low + close) / 3.0;
     }
 };
+
+struct DerivedFeatures
+{
+    double log_return{0.0};
+    double simple_return{0.0};
+    double rolling_volatility{0.0};
+    double volume_ratio{0.0};
+};

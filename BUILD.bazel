@@ -3,7 +3,7 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 cc_binary(
     name = "quant",
     deps = [
-       "//include:quant_lib",
+       "//include/quant:quant_lib",
     ],
     srcs = [
         "quant.cpp"

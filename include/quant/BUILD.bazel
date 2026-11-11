@@ -1,0 +1,20 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "quant_lib",
+    hdrs = [
+        "core/matrix.hpp",
+        "core/ring_buffer.hpp",
+        "core/types.hpp",
+        "data/csv_reader.hpp",
+        "features/feature_engine.hpp",
+        "features/online_stats.hpp",
+        "models/empirical_kernel.hpp",
+        "models/interfaces.hpp",
+        "models/kinetic_model.hpp",
+        "risk/risk_manager.hpp",
+        "telemetry/console_reporter.hpp",
+    ],
+    includes = ["../../include"],
+    visibility = ["//visibility:public"],
+)

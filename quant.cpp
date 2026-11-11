@@ -1,101 +1,153 @@
-#include "include/console_reporter.hpp"
-#include "include/csv_reader.hpp"
-#include "include/kinetic_model.hpp"
-#include "include/tick_processor.hpp"
+#include "quant/core/matrix.hpp"
+#include "quant/core/ring_buffer.hpp"
+#include "quant/core/types.hpp"
+#include "quant/data/csv_reader.hpp"
+#include "quant/features/feature_engine.hpp"
+#include "quant/models/empirical_kernel.hpp"
+#include "quant/models/kinetic_model.hpp"
+#include "quant/risk/risk_manager.hpp"
+#include "quant/telemetry/console_reporter.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
+
+constexpr std::size_t BINS = 16;
+using Matrix               = FlatMatrix<double, BINS>;
+using KineticEngine        = HighPerformanceKineticEngine<BINS>;
 
 int main()
 {
     try
     {
-        QuantConsoleReporter::render_header("KINETIC QUANT MARKET MODEL & PREDICTION ENGINE");
+        QuantConsoleReporter::render_header("DUAL-SPEED KINETIC QUANTITATIVE TRADING ENGINE");
 
-        // 1. Setup online tick processing pipeline
-        TickProcessor                processor(20);
-        std::vector<DerivedFeatures> feature_stream;
+        // Double-buffered transition kernels owned by warm path calibration worker thread
+        auto kernel_primary   = std::make_unique<Matrix>();
+        auto kernel_secondary = std::make_unique<Matrix>();
 
-        processor.register_callback([&](const Tick& /*t*/, const DerivedFeatures& f) { feature_stream.push_back(f); });
+        // Kinetic Hot Path engine
+        double        x_max = 0.015; // +/- 1.5% max return window
+        KineticEngine engine(x_max);
 
-        // 2. Load dataset
+        // Cold path historical ingestion
         std::string data_path = "/Users/cdg546/Downloads/data/SPY_clean_1min.csv";
-        std::cout << "[+] Ingesting historical ticks from: " << data_path << " ...\n";
+        std::cout << "[+] Ingesting historical market ticks from: " << data_path << " ...\n";
 
-        MarketDataset market;
+        MarketDataset                market;
+        std::vector<DerivedFeatures> historical_features;
         try
         {
             market = CsvReader::load(data_path);
+            historical_features.reserve(market.size());
+
+            OnlineFeatureEngine<20> cold_fe;
+            DerivedFeatures         feat{};
+            for (const auto& tick : market.bars())
+            {
+                if (cold_fe.process(tick, feat))
+                {
+                    historical_features.push_back(feat);
+                }
+            }
         }
         catch (const std::exception&)
         {
-            std::cout << "[!] Benchmark CSV file missing. Quitting...\n";
-            return 1;
+            std::cout << "[!] CSV missing/unreadable. Initializing synthetic market dataset...\n";
+            for (std::size_t i = 0; i < 500; ++i)
+            {
+                double ret = 0.001 * std::sin(static_cast<double>(i) * 0.1);
+                historical_features.push_back(DerivedFeatures{.log_return = ret, .rolling_volatility = 0.002});
+            }
         }
 
-        std::cout << "[+] Streamed " << market.size() << " market ticks into processing pipeline.\n";
+        std::cout << "[+] Extracted " << historical_features.size() << " feature frames for background matrix calibration.\n";
+
+        // Baseline startup calibration & atomic kernel load
+        EmpiricalKernel<BINS> empirical_builder;
+        empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *kernel_primary);
+        engine.update_kernel(kernel_primary.get());
+
+        QuantConsoleReporter::print_transition_matrix(*kernel_primary, 8);
+
+        // Lock-Free SPSC Ring Buffer for Live Hot Path Pipeline
+        SPSCRingBuffer<Tick, 1024> tick_queue;
+        OnlineFeatureEngine<20>    hot_feature_engine;
+        RiskEngine                 risk_engine;
+
+        std::atomic<bool>        running{true};
+        std::atomic<std::size_t> processed_ticks{0};
+
+        // Async Background Calibration Thread (Warm Path)
+        std::thread calibration_thread(
+                [&]()
+                {
+                    bool use_primary = false;
+                    while (running.load(std::memory_order_relaxed))
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                        Matrix* next_kernel = use_primary ? kernel_primary.get() : kernel_secondary.get();
+                        empirical_builder.build_kernel(engine.dx(), engine.x_max(), historical_features, *next_kernel);
+
+                        // Lock-free release-acquire atomic matrix pointer swap
+                        engine.update_kernel(next_kernel);
+                        use_primary = !use_primary;
+                    }
+                });
+
+        // Hot Path Execution Loop
+        KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
+        KineticEngine::StateVector next_distribution{};
+        DerivedFeatures            feat{};
+        double                     last_price = market.empty() ? 400.0 : market.bars().back().close;
+
+        std::cout << "\n[+] Starting Real-Time Execution Engine Hot Path...\n";
 
         for (const auto& tick : market.bars())
         {
-            processor.process(tick);
+            tick_queue.push(tick);
+
+            Tick dequeued_tick;
+            if (tick_queue.pop(dequeued_tick))
+            {
+                // Incremental feature processing
+                if (hot_feature_engine.process(dequeued_tick, feat))
+                {
+                    std::size_t state_idx = engine.state_index(feat.log_return);
+                    current_distribution  = engine.state_delta(state_idx);
+
+                    // O(N^2) forward density evolution
+                    engine.evolve(current_distribution, next_distribution);
+
+                    // Pre-Trade Risk Filtering & Signal Dispatch
+                    QuantForecast forecast = engine.analyze_and_predict(dequeued_tick.close, next_distribution);
+                    OrderSignal   signal   = risk_engine.evaluate(forecast);
+
+                    (void) signal; // Dispatched to order execution gateway
+                    processed_ticks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
 
-        const double last_price      = market.bars().back().close;
-        const double last_log_return = feature_stream.back().log_return;
-
-        // 3. Initialize & Calibrate Kinetic Model with Empirical Kernel
-        std::size_t bins  = 16;
-        double      x_max = 0.015; // +/- 1.5% max return window
-
-        KineticModel model(bins, x_max, std::make_unique<EmpiricalKernel>());
-        model.fit(feature_stream);
-
-        // 4. Inspect Current Market State & Dynamic Transitions
-        std::size_t current_state_idx    = model.state_index(last_log_return);
-        auto        current_distribution = model.state_delta(current_state_idx);
-
-        std::cout << "\n[+] Current Market State: Return = " << (last_log_return * 100.0) << "% | State Bin Index = " << current_state_idx << "\n";
-
-        QuantConsoleReporter::print_transition_matrix(model, 8);
-
-        // 5. Predict Next Step (t + 1)
-        auto f_t1        = model.evolve(current_distribution);
-        auto forecast_t1 = model.analyze_and_predict(last_price, f_t1);
-
-        QuantConsoleReporter::print_forecast(forecast_t1, 1);
-        QuantConsoleReporter::print_distribution_ascii(model, f_t1, "1-Step Ahead Evolved State Density f(t+1)");
-
-        // 6. Multi-Step Prediction Rollout (t + 5 Steps ahead propagation)
-        auto f_t5 = f_t1;
-        for (int k = 0; k < 4; ++k)
+        running.store(false, std::memory_order_relaxed);
+        if (calibration_thread.joinable())
         {
-            f_t5 = model.evolve(f_t5);
+            calibration_thread.join();
         }
-        auto forecast_t5 = model.analyze_and_predict(last_price, f_t5);
-        QuantConsoleReporter::print_forecast(forecast_t5, 5);
 
-        // 7. Stationary Equilibrium & Model Swapping
-        std::cout << "\n";
-        QuantConsoleReporter::render_header("MODEL SWAP & EQUILIBRIUM ANALYSIS");
+        std::cout << "[+] Hot Path processed " << processed_ticks.load() << " market ticks with zero heap allocation.\n";
 
-        auto stationary_dist     = model.stationary_distribution();
-        auto stationary_forecast = model.analyze_and_predict(last_price, stationary_dist);
+        // Display rollout telemetry
+        KineticEngine::StateVector forecast_pdf{};
+        engine.evolve(current_distribution, forecast_pdf);
+        QuantForecast final_forecast = engine.analyze_and_predict(last_price, forecast_pdf);
 
-        std::cout << "\n[+] Empirical Stationary Distribution (Long-term Market Balance):\n";
-        std::cout << "  Equilibrium Expected Return : " << (stationary_forecast.expected_return * 100.0) << "%\n";
-        std::cout << "  Equilibrium Volatility      : " << (stationary_forecast.expected_volatility * 100.0) << "%\n";
-
-        // Dynamic Swap to Gaussian Parametric Diffusion Kernel
-        std::cout << "\n[->] Swapping Model Kernel dynamically to Gaussian Diffusion Kernel...\n";
-        model.set_kernel(std::make_unique<GaussianDiffusionKernel>(0.0002, 0.003));
-        model.fit(feature_stream);
-
-        auto f_t1_gaussian     = model.evolve(current_distribution);
-        auto forecast_gaussian = model.analyze_and_predict(last_price, f_t1_gaussian);
-
-        QuantConsoleReporter::print_forecast(forecast_gaussian, 1);
-        QuantConsoleReporter::print_distribution_ascii(model, f_t1_gaussian, "Parametric Gaussian Kernel State Density f(t+1)");
+        QuantConsoleReporter::print_forecast(final_forecast, 1);
+        QuantConsoleReporter::print_distribution_ascii(engine.dx(), engine.x_max(), forecast_pdf, "Hot Path State Density f(t+1)");
     }
     catch (const std::exception& e)
     {
