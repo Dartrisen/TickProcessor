@@ -2,8 +2,10 @@
 
 #include "quant/core/matrix.hpp"
 #include "quant/models/interfaces.hpp"
+#include "quant/risk/risk_manager.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -11,36 +13,74 @@
 class QuantConsoleReporter
 {
 public:
+    // ANSI Color Escape Codes
+    static constexpr const char* RESET   = "\033[0m";
+    static constexpr const char* BOLD    = "\033[1m";
+    static constexpr const char* RED     = "\033[1;31m";
+    static constexpr const char* GREEN   = "\033[1;32m";
+    static constexpr const char* YELLOW  = "\033[1;33m";
+    static constexpr const char* CYAN    = "\033[1;36m";
+    static constexpr const char* MAGENTA = "\033[1;35m";
+    static constexpr const char* GRAY    = "\033[1;30m";
+    static constexpr const char* WHITE   = "\033[1;37m";
+
     static void render_header(const std::string& title)
     {
-        std::cout << "\n========================================================================================================\n";
-        std::cout << "  " << title << "\n";
-        std::cout << "========================================================================================================\n";
+        std::cout << "\n" << CYAN << "========================================================================================================\n";
+        std::cout << "  " << BOLD << WHITE << title << RESET << CYAN << "\n";
+        std::cout << "========================================================================================================\n" << RESET;
+    }
+
+    static void print_signal_event(const std::string& timestamp, double price, const SignalDecision& decision, const QuantForecast& forecast)
+    {
+        std::cout << std::fixed << std::setprecision(4);
+
+        std::string signal_tag;
+        if (decision.signal == OrderSignal::Buy)
+        {
+            signal_tag = std::string(GREEN) + BOLD + "[SIGNAL: BUY] " + RESET;
+        }
+        else if (decision.signal == OrderSignal::Sell)
+        {
+            signal_tag = std::string(RED) + BOLD + "[SIGNAL: SELL]" + RESET;
+        }
+        else
+        {
+            signal_tag = std::string(YELLOW) + BOLD + "[SIGNAL: HOLD]" + RESET;
+        }
+
+        std::cout << GRAY << "[" << timestamp << "] " << RESET << signal_tag << " Price: " << BOLD << "$" << price << RESET
+                  << " | E[r]: " << (forecast.expected_return >= 0 ? GREEN : RED) << (forecast.expected_return * 100.0) << "%" << RESET
+                  << " | P(r>0): " << (forecast.prob_positive_return > 0.5 ? GREEN : RED) << (forecast.prob_positive_return * 100.0) << "%" << RESET
+                  << " | VaR(95): " << (decision.var_passed ? GREEN : RED) << (forecast.var_95 * 100.0) << "%" << RESET << "\n  " << GRAY << "└─► Reason: " << WHITE
+                  << decision.reason << RESET << "\n";
     }
 
     static void print_forecast(const QuantForecast& f, std::size_t horizon_steps = 1)
     {
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "\n+------------------------------------------------------------------------------------------------------+\n";
-        std::cout << "| MARKET FORECAST & RISK PROFILE (Horizon: +" << horizon_steps << " step(s))                                         |\n";
-        std::cout << "+------------------------------------------------------------------------------------------------------+\n";
-        std::cout << "  Current Asset Price       : $" << f.current_price << "\n";
-        std::cout << "  Expected Price (E[P])     : $" << f.expected_price << "  (Return: " << (f.expected_return * 100.0) << "%)\n";
+        std::cout << "\n" << CYAN << "+------------------------------------------------------------------------------------------------------+\n";
+        std::cout << "| " << BOLD << WHITE << "MARKET FORECAST & RISK PROFILE (Horizon: +" << horizon_steps << " step(s))" << RESET << CYAN
+                  << "                                         |\n";
+        std::cout << "+------------------------------------------------------------------------------------------------------+\n" << RESET;
+        std::cout << "  Current Asset Price       : " << BOLD << "$" << f.current_price << RESET << "\n";
+        std::cout << "  Expected Price (E[P])     : " << BOLD << "$" << f.expected_price << RESET << "  (Return: " << (f.expected_return >= 0 ? GREEN : RED)
+                  << (f.expected_return * 100.0) << "%" << RESET << ")\n";
         std::cout << "  Most Likely Price (Mode)  : $" << f.mode_price << "\n";
         std::cout << "  95% Confidence Interval   : [$" << f.price_ci_lower_95 << " --- $" << f.price_ci_upper_95 << "]\n";
-        std::cout << "--------------------------------------------------------------------------------------------------------\n";
-        std::cout << "  Expected Volatility (σ)   : " << (f.expected_volatility * 100.0) << "%\n";
-        std::cout << "  Bullish Probability P(r>0): " << (f.prob_positive_return * 100.0) << "%\n";
-        std::cout << "  Value at Risk (95% VaR)   : " << (f.var_95 * 100.0) << "% log-loss\n";
-        std::cout << "  Expected Shortfall (CVaR) : " << (f.cvar_95 * 100.0) << "% expected tail loss\n";
-        std::cout << "  Kinetic Entropy (Uncert.) : " << f.distribution_entropy << " bits\n";
-        std::cout << "+------------------------------------------------------------------------------------------------------+\n";
+        std::cout << GRAY << "--------------------------------------------------------------------------------------------------------\n" << RESET;
+        std::cout << "  Expected Volatility (σ)   : " << YELLOW << (f.expected_volatility * 100.0) << "%" << RESET << "\n";
+        std::cout << "  Bullish Probability P(r>0): " << (f.prob_positive_return >= 0.5 ? GREEN : RED) << (f.prob_positive_return * 100.0) << "%" << RESET << "\n";
+        std::cout << "  Value at Risk (95% VaR)   : " << RED << (f.var_95 * 100.0) << "% log-loss" << RESET << "\n";
+        std::cout << "  Expected Shortfall (CVaR) : " << RED << (f.cvar_95 * 100.0) << "% expected tail loss" << RESET << "\n";
+        std::cout << "  Kinetic Entropy (Uncert.) : " << MAGENTA << f.distribution_entropy << " bits" << RESET << "\n";
+        std::cout << CYAN << "+------------------------------------------------------------------------------------------------------+\n" << RESET;
     }
 
     template <std::size_t Bins>
     static void print_distribution_ascii(double dx, double x_max, const std::array<double, Bins>& dist, const std::string& label)
     {
-        std::cout << "\n--- Density Distribution: " << label << " ---\n";
+        std::cout << "\n" << BOLD << WHITE << "--- Density Distribution: " << label << " ---" << RESET << "\n";
         constexpr std::size_t max_bar_width = 40;
 
         double max_p = 0.0;
@@ -57,8 +97,10 @@ public:
             auto   bar_len = static_cast<std::size_t>((prob / (max_p > 0 ? max_p : 1.0)) * max_bar_width);
 
             std::string bar(bar_len, '#');
-            std::cout << std::right << std::setw(7) << std::fixed << std::setprecision(4) << center << " | " << std::left << std::setw(max_bar_width) << bar << " | "
-                      << std::setw(6) << std::setprecision(2) << (prob * 100.0) << "%\n";
+            const char* color = (center > 0.0) ? GREEN : (center < 0.0 ? RED : GRAY);
+
+            std::cout << std::right << std::setw(7) << std::fixed << std::setprecision(4) << center << " | " << color << std::left << std::setw(max_bar_width) << bar << RESET
+                      << " | " << std::setw(6) << std::setprecision(2) << (prob * 100.0) << "%\n";
         }
     }
 
@@ -67,23 +109,43 @@ public:
     {
         std::size_t bins = std::min(Bins, max_display_bins);
 
-        std::cout << "\n--- Dynamic Transition Kernel Matrix W(i -> j) (First " << bins << "x" << bins << " state subset) ---\n";
+        std::cout << "\n" << BOLD << WHITE << "--- Dynamic Transition Kernel Matrix W(i -> j) (First " << bins << "x" << bins << " state subset) ---" << RESET << "\n";
         std::cout << "       ";
         for (std::size_t j = 0; j < bins; ++j)
         {
-            std::cout << "  Bin" << std::setw(2) << j;
+            std::cout << CYAN << "  Bin" << std::setw(2) << j << RESET;
         }
         std::cout << "\n";
 
         for (std::size_t i = 0; i < bins; ++i)
         {
-            std::cout << "Bin" << std::setw(2) << i << " |";
+            std::cout << CYAN << "Bin" << std::setw(2) << i << RESET << " |";
             for (std::size_t j = 0; j < bins; ++j)
             {
                 double val = W(i, j);
-                std::cout << std::right << std::setw(7) << std::fixed << std::setprecision(3) << val;
+                if (val > 0.2)
+                    std::cout << BOLD << GREEN;
+                else if (val > 0.05)
+                    std::cout << WHITE;
+                else
+                    std::cout << GRAY;
+
+                std::cout << std::right << std::setw(7) << std::fixed << std::setprecision(3) << val << RESET;
             }
             std::cout << "\n";
         }
+    }
+
+    static void print_execution_summary(std::size_t total_ticks, std::size_t buys, std::size_t sells, std::size_t holds, std::size_t risk_rejections)
+    {
+        std::cout << "\n" << CYAN << "========================================================================================================\n";
+        std::cout << "  " << BOLD << WHITE << "PRE-TRADE RISK & EXECUTION TELEMETRY SUMMARY" << RESET << CYAN << "\n";
+        std::cout << "========================================================================================================\n" << RESET;
+        std::cout << "  Total Hot Path Ticks Evaluated : " << BOLD << total_ticks << RESET << "\n";
+        std::cout << "  " << GREEN << BOLD << "Buy Signals Executed [BUY]    : " << buys << RESET << "\n";
+        std::cout << "  " << RED << BOLD << "Sell Signals Executed [SELL]  : " << sells << RESET << "\n";
+        std::cout << "  " << YELLOW << "Hold Decisions [HOLD]         : " << holds << RESET << "\n";
+        std::cout << "  " << MAGENTA << "Risk Limits Vetoed Trades     : " << risk_rejections << RESET << "\n";
+        std::cout << CYAN << "========================================================================================================\n" << RESET;
     }
 };
