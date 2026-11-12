@@ -4,12 +4,14 @@ cc_library(
     name = "app_support",
     hdrs = [
         "include/quant/core/config.hpp",
+        "include/quant/session/trading_session.hpp",
         "include/quant/telemetry/console_reporter.hpp",
     ],
     includes = ["include"],
     deps = [
         "@execution_simulator",
         "@kinetic_model",
+        "@market_simulator",
     ],
 )
 
