@@ -2,13 +2,14 @@
 
 #include "quant/models/interfaces.hpp"
 
+#include <cmath>
 #include <string>
 
 enum class OrderSignal
 {
     Hold,
-    Buy,
-    Sell
+    Buy, // target long
+    Sell // target short
 };
 
 struct SignalDecision
@@ -23,11 +24,16 @@ struct SignalDecision
 
 struct RiskLimits
 {
-    double max_var_95{0.05};             // 5% max log-loss VaR threshold
-    double min_entropy{0.5};             // Minimum predictive certainty threshold
-    double min_expected_return{0.00005}; // Alpha hurdle rate (+0.005% return)
-    double min_bullish_prob{0.52};       // Minimum bullish probability for BUY
-    double max_bearish_prob{0.48};       // Maximum probability threshold for SELL
+    // Positive loss magnitude, e.g. 0.01 = maximum tolerated 1% 95%-VaR.
+    double max_var_95{0.01};
+
+    // Entropy is uncertainty. Higher entropy means a flatter, less informative forecast.
+    // For 16 bins, uniform entropy is log2(16) = 4 bits.
+    double max_entropy{3.20};
+
+    double min_expected_return{0.00005};
+    double min_bullish_prob{0.52};
+    double max_bearish_prob{0.48};
 };
 
 class RiskEngine
@@ -39,14 +45,17 @@ public:
     {
         SignalDecision decision;
 
-        decision.var_passed     = std::abs(forecast.var_95) <= limits_.max_var_95;
-        decision.entropy_passed = forecast.distribution_entropy >= limits_.min_entropy;
+        // var_95 is explicitly stored as a positive loss magnitude.
+        decision.var_passed = forecast.var_95 <= limits_.max_var_95;
+
+        // High entropy = high uncertainty, so reject forecasts above the limit.
+        decision.entropy_passed = forecast.distribution_entropy <= limits_.max_entropy;
 
         if (!decision.var_passed)
         {
             decision.signal    = OrderSignal::Hold;
             decision.risk_veto = true;
-            decision.reason    = "VETO: VaR(95%) " + std::to_string(forecast.var_95 * 100.0) + "% exceeds max limit " + std::to_string(limits_.max_var_95 * 100.0) + "%";
+            decision.reason    = "VETO: VaR(95%) loss " + std::to_string(forecast.var_95 * 100.0) + "% exceeds max loss limit " + std::to_string(limits_.max_var_95 * 100.0) + "%";
             return decision;
         }
 
@@ -54,7 +63,8 @@ public:
         {
             decision.signal    = OrderSignal::Hold;
             decision.risk_veto = true;
-            decision.reason    = "VETO: Model entropy (" + std::to_string(forecast.distribution_entropy) + ") below certainty floor (" + std::to_string(limits_.min_entropy) + ")";
+            decision.reason =
+                    "VETO: Forecast entropy (" + std::to_string(forecast.distribution_entropy) + ") exceeds max uncertainty (" + std::to_string(limits_.max_entropy) + ")";
             return decision;
         }
 
@@ -65,14 +75,14 @@ public:
         {
             decision.signal        = OrderSignal::Buy;
             decision.return_passed = true;
-            decision.reason        = "BUY PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) > Hurdle & P(r>0) (" +
+            decision.reason        = "BUY PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) > hurdle and P(r>0) (" +
                               std::to_string(forecast.prob_positive_return * 100.0) + "%) >= " + std::to_string(limits_.min_bullish_prob * 100.0) + "%";
         }
         else if (strong_alpha_sell)
         {
             decision.signal        = OrderSignal::Sell;
             decision.return_passed = true;
-            decision.reason        = "SELL PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) < Hurdle & P(r>0) (" +
+            decision.reason        = "SELL/SHORT PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) < -hurdle and P(r>0) (" +
                               std::to_string(forecast.prob_positive_return * 100.0) + "%) <= " + std::to_string(limits_.max_bearish_prob * 100.0) + "%";
         }
         else

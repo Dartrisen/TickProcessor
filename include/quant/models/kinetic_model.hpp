@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 
 template <std::size_t Bins>
 class HighPerformanceKineticEngine
@@ -29,7 +30,7 @@ public:
         {
             const double f_i = in_pdf[i];
             if (f_i <= 1e-12)
-                continue; // Early exit for sparse probabilities
+                continue;
 
             for (std::size_t j = 0; j < Bins; ++j)
             {
@@ -76,81 +77,114 @@ public:
         QuantForecast forecast;
         forecast.current_price = current_price;
 
-        double mean_r   = 0.0;
-        double var_r    = 0.0;
-        double prob_pos = 0.0;
-        double entropy  = 0.0;
+        double total_probability         = 0.0;
+        double mean_log_return           = 0.0;
+        double expected_price_multiplier = 0.0;
+        double prob_positive             = 0.0;
+        double entropy                   = 0.0;
 
-        std::size_t max_idx  = 0;
-        double      max_prob = -1.0;
+        std::size_t mode_index = 0;
+        double      mode_prob  = -1.0;
 
         for (std::size_t i = 0; i < Bins; ++i)
         {
-            double r = bin_center(i);
-            double p = dist[i];
+            const double r = bin_center(i);
+            const double p = std::max(0.0, dist[i]);
 
-            mean_r += p * r;
+            total_probability += p;
+            mean_log_return += p * r;
+            expected_price_multiplier += p * std::exp(r);
+
             if (r > 0.0)
-                prob_pos += p;
-            if (p > max_prob)
+                prob_positive += p;
+
+            if (p > mode_prob)
             {
-                max_prob = p;
-                max_idx  = i;
+                mode_prob  = p;
+                mode_index = i;
             }
+
             if (p > 1e-12)
-            {
                 entropy -= p * std::log2(p);
+        }
+
+        // Defensive normalization if a future kernel implementation produces
+        // a nearly-normalized vector rather than an exact probability vector.
+        if (total_probability <= 1e-12)
+            return forecast;
+
+        if (std::abs(total_probability - 1.0) > 1e-10)
+        {
+            mean_log_return /= total_probability;
+            expected_price_multiplier /= total_probability;
+            prob_positive /= total_probability;
+            entropy = 0.0;
+
+            for (std::size_t i = 0; i < Bins; ++i)
+            {
+                const double p = std::max(0.0, dist[i]) / total_probability;
+                if (p > 1e-12)
+                    entropy -= p * std::log2(p);
             }
         }
 
+        double variance = 0.0;
         for (std::size_t i = 0; i < Bins; ++i)
         {
-            double diff = bin_center(i) - mean_r;
-            var_r += dist[i] * diff * diff;
+            const double p    = std::max(0.0, dist[i]) / total_probability;
+            const double diff = bin_center(i) - mean_log_return;
+            variance += p * diff * diff;
         }
 
-        forecast.expected_return      = mean_r;
-        forecast.expected_volatility  = std::sqrt(var_r);
-        forecast.prob_positive_return = prob_pos;
+        auto return_quantile = [&](double probability) noexcept
+        {
+            double cumulative = 0.0;
+
+            for (std::size_t i = 0; i < Bins; ++i)
+            {
+                cumulative += std::max(0.0, dist[i]) / total_probability;
+                if (cumulative >= probability)
+                    return bin_center(i);
+            }
+
+            return bin_center(Bins - 1);
+        };
+
+        // Average log-return in the worst 5% tail, including a fractional
+        // contribution from the bin that crosses the 5% probability boundary.
+        constexpr double tail_probability           = 0.05;
+        double           remaining_tail_probability = tail_probability;
+        double           tail_return_sum            = 0.0;
+
+        for (std::size_t i = 0; i < Bins && remaining_tail_probability > 1e-12; ++i)
+        {
+            const double p                = std::max(0.0, dist[i]) / total_probability;
+            const double used_probability = std::min(p, remaining_tail_probability);
+
+            tail_return_sum += used_probability * bin_center(i);
+            remaining_tail_probability -= used_probability;
+        }
+
+        const double q025 = return_quantile(0.025);
+        const double q05  = return_quantile(0.05);
+        const double q975 = return_quantile(0.975);
+
+        forecast.expected_return      = mean_log_return;
+        forecast.expected_volatility  = std::sqrt(std::max(0.0, variance));
+        forecast.prob_positive_return = prob_positive;
         forecast.distribution_entropy = entropy;
 
-        forecast.expected_price = current_price * std::exp(mean_r);
-        forecast.mode_price     = current_price * std::exp(bin_center(max_idx));
+        // Arithmetic expectation: E[P(t+1)] = P(t) * sum(p_i * exp(r_i)).
+        forecast.expected_price = current_price * expected_price_multiplier;
+        forecast.mode_price     = current_price * std::exp(bin_center(mode_index));
 
-        double cum_prob   = 0.0;
-        double var_95_val = bin_center(0);
-        double cvar_sum   = 0.0;
-        double cvar_prob  = 0.0;
+        forecast.price_ci_lower_95 = current_price * std::exp(q025);
+        forecast.price_ci_upper_95 = current_price * std::exp(q975);
 
-        for (std::size_t i = 0; i < Bins; ++i)
-        {
-            cum_prob += dist[i];
-            if (cum_prob <= 0.05)
-            {
-                cvar_sum += dist[i] * bin_center(i);
-                cvar_prob += dist[i];
-            }
-            if (cum_prob >= 0.05 && forecast.var_95 == 0.0)
-            {
-                var_95_val      = bin_center(i);
-                forecast.var_95 = var_95_val;
-            }
-            if (cum_prob >= 0.025 && forecast.price_ci_lower_95 == 0.0)
-            {
-                forecast.price_ci_lower_95 = current_price * std::exp(bin_center(i));
-            }
-            if (cum_prob >= 0.975 && forecast.price_ci_upper_95 == 0.0)
-            {
-                forecast.price_ci_upper_95 = current_price * std::exp(bin_center(i));
-            }
-        }
+        // Store VaR/CVaR as POSITIVE loss magnitudes, not negative returns.
+        forecast.var_95  = std::max(0.0, -q05);
+        forecast.cvar_95 = std::max(0.0, -(tail_return_sum / tail_probability));
 
-        if (forecast.price_ci_upper_95 == 0.0)
-        {
-            forecast.price_ci_upper_95 = current_price * std::exp(bin_center(Bins - 1));
-        }
-
-        forecast.cvar_95 = (cvar_prob > 0.0) ? (cvar_sum / cvar_prob) : var_95_val;
         return forecast;
     }
 
