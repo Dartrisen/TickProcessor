@@ -3,6 +3,21 @@
 #include <cstdint>
 #include <string>
 
+enum class PositionSide
+{
+    Flat,
+    Long,
+    Short
+};
+
+enum class OrderSignal
+{
+    Hold,
+    Buy,  // Target long exposure
+    Sell, // Target short exposure
+    Close // Exit existing position to flat (alpha fade / time stop)
+};
+
 struct Tick
 {
     std::string   datetime;

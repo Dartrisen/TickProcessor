@@ -1,10 +1,11 @@
 #include "quant/core/config.hpp"
 #include "quant/core/matrix.hpp"
-#include "quant/core/ring_buffer.hpp"
 #include "quant/core/types.hpp"
-#include "quant/data/csv_reader.hpp"
+#include "quant/execution/execution_gateway.hpp"
 #include "quant/execution/simulated_exchange.hpp"
 #include "quant/features/feature_engine.hpp"
+#include "quant/market/csv_reader.hpp"
+#include "quant/market/market_feed.hpp"
 #include "quant/models/kernels.hpp"
 #include "quant/models/kinetic_model.hpp"
 #include "quant/risk/risk_manager.hpp"
@@ -17,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 template <std::size_t BINS, std::size_t VOL_WINDOW>
@@ -25,51 +27,62 @@ void run_simulation(const EngineConfig& cfg)
     using Matrix        = FlatMatrix<double, BINS>;
     using KineticEngine = HighPerformanceKineticEngine<BINS>;
 
-    // Configure Exchange Simulation & Fee Model from config
-    FeeStructure      fees{.commission_rate = cfg.commission_rate, .fixed_fee_per_trade = cfg.fixed_fee, .slippage_bps = cfg.slippage_bps};
-    const double      initial_cash = cfg.initial_capital;
-    SimulatedExchange exchange(initial_cash, fees);
+    // 1. Initialize Execution Gateway (swap SimulatedExchange for a live broker adapter later)
+    const FeeStructure fees{
+            .commission_rate     = cfg.commission_rate,
+            .fixed_fee_per_trade = cfg.fixed_fee,
+            .slippage_bps        = cfg.slippage_bps,
+    };
+    const double                       initial_cash = cfg.initial_capital;
+    std::unique_ptr<IExecutionGateway> broker       = std::make_unique<SimulatedExchange>(initial_cash, fees);
 
-    // Load Historical Market CSV Ticks
-    std::cout << "[+] Connecting to simulated market feed: " << QuantConsoleReporter::CYAN << cfg.data_path << QuantConsoleReporter::RESET << " ...\n";
-
-    MarketDataset market;
-    try
-    {
-        market = CsvReader::load(cfg.data_path);
-    }
-    catch (const std::exception& e)
-    {
-        throw std::runtime_error("Failed to load market data from '" + cfg.data_path + "': " + e.what());
-    }
-
-    const std::size_t total_bars = market.size();
+    // 2. Initialize Market Data Feed (swap CsvMarketFeed for LiveRingBufferFeed<4096> later)
+    std::cout << "[+] Connecting to market feed: " << QuantConsoleReporter::CYAN << cfg.data_path << QuantConsoleReporter::RESET << " ...\n";
+    // Load CSV dataset and split warmup vs. out-of-sample replay[cite: 1]
+    const MarketDataset dataset    = CsvReader::load(cfg.data_path);
+    const std::size_t   total_bars = dataset.size();
     if (total_bars < 10)
     {
         throw std::runtime_error("Insufficient market bars loaded for simulation.");
     }
 
-    // In-Sample Calibration Split (eliminates lookahead bias on out-of-sample test bars)
-    const std::size_t train_size = std::max<std::size_t>(2, static_cast<std::size_t>(static_cast<double>(total_bars) * cfg.train_split_ratio));
+    const std::size_t train_size  = std::max<std::size_t>(2, static_cast<std::size_t>(static_cast<double>(total_bars) * cfg.train_split_ratio));
+    const std::size_t replay_size = total_bars - train_size;
+    const auto        warmup_bars = dataset.bars().subspan(0, train_size);
+    const auto        oos_bars    = dataset.bars().subspan(train_size);
 
+    auto ring_feed = std::make_unique<LiveRingBufferFeed<4096>>(dataset[0].source);
+
+    // Producer thread: simulates a live broker pushing ticks into the SPSC ring buffer.
+    // Later, swap this thread with your real broker API callback calling ring_feed->push_tick(tick).
+    std::jthread csv_producer(
+            [feed = ring_feed.get(), oos_bars]()
+            {
+                for (const auto& bar : oos_bars)
+                {
+                    feed->push_blocking(bar);
+                }
+                feed->mark_exhausted();
+            });
+
+    IMarketDataFeed&             market_feed = *ring_feed;
     std::vector<DerivedFeatures> train_features;
-    train_features.reserve(train_size);
+    train_features.reserve(warmup_bars.size());
 
     OnlineFeatureEngine<VOL_WINDOW> feature_engine;
     DerivedFeatures                 feat{};
 
-    for (std::size_t i = 0; i < train_size; ++i)
+    for (const auto& bar : warmup_bars)
     {
-        if (feature_engine.process(market[i], feat))
+        if (feature_engine.process(bar, feat))
         {
             train_features.push_back(feat);
         }
     }
 
-    std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << total_bars << QuantConsoleReporter::RESET << " total ticks (Source: " << market[0].source
-              << " | In-Sample Calibration: " << train_size << " | Out-of-Sample Test: " << (total_bars - train_size) << ").\n";
+    std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << total_bars << QuantConsoleReporter::RESET << " total ticks (Source: " << market_feed.source_name()
+              << " | In-Sample Calibration: " << train_size << " | Out-of-Sample Test: " << replay_size << ").\n";
 
-    // Setup Kinetic Strategy Engine & Calibrate Baseline Kernel on Training Slice
     KineticEngine engine(cfg.x_max);
     auto          kernel = std::make_unique<Matrix>();
 
@@ -77,14 +90,12 @@ void run_simulation(const EngineConfig& cfg)
     kernel_builder.build_kernel(engine.dx(), engine.x_max(), train_features, *kernel);
     engine.update_kernel(kernel.get());
 
-    // Out-of-Sample Live Pipeline Components
     RiskEngine                          risk_engine(cfg.risk_limits);
     typename KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
     typename KineticEngine::StateVector next_distribution{};
 
-    QuantConsoleReporter::render_header("SIMULATED ORDER GATEWAY & LIVE TRADE EXECUTION STREAM");
+    QuantConsoleReporter::render_header("ORDER GATEWAY & TRADE EXECUTION STREAM");
 
-    // Maintain a trailing feature window for causal walk-forward recalibration
     std::vector<DerivedFeatures> rolling_features   = train_features;
     const std::size_t            calibration_window = train_features.size();
     std::size_t                  bars_since_recal   = 0;
@@ -113,14 +124,31 @@ void run_simulation(const EngineConfig& cfg)
                   << QuantConsoleReporter::RESET << "\n";
     };
 
-    for (std::size_t i = train_size; i < total_bars; ++i)
+    bool   has_first_oos_bar = false;
+    double start_oos_price   = 0.0;
+    Tick   last_tick{};
+    Tick   tick{};
+
+    // 4. Unified Event Loop (works identically for CSV replay or live ring-buffer tick stream)
+    while (!market_feed.is_exhausted())
     {
-        const auto& tick = market[i];
+        if (!market_feed.next(tick))
+        {
+            std::this_thread::yield();
+            continue;
+        }
+
+        if (!has_first_oos_bar)
+        {
+            start_oos_price   = tick.close;
+            has_first_oos_bar = true;
+        }
+        last_tick = tick;
 
         // Stage 1 (Bar Open): Execute protective flattens or validated open orders
-        if (pending_flatten && exchange.account().position_shares != 0.0)
+        if (pending_flatten && broker->account().position_shares != 0.0)
         {
-            const auto fill = exchange.close_position(tick.datetime, tick.open);
+            const auto fill = broker->close_position(tick.datetime, tick.open);
             log_close_fill("RISK FLATTEN EXIT   ", fill);
             bars_held       = 0;
             pending_flatten = false;
@@ -130,9 +158,9 @@ void run_simulation(const EngineConfig& cfg)
         {
             if (pending_order->signal == OrderSignal::Close)
             {
-                if (exchange.account().position_shares != 0.0)
+                if (broker->account().position_shares != 0.0)
                 {
-                    const auto fill = exchange.close_position(tick.datetime, tick.open);
+                    const auto fill = broker->close_position(tick.datetime, tick.open);
                     log_close_fill("EXECUTED EXIT/CLOSE ", fill);
                     bars_held = 0;
                 }
@@ -147,7 +175,7 @@ void run_simulation(const EngineConfig& cfg)
                     const double        entry_gap     = std::log(tick.open / pending_order->signal_close_price);
                     const QuantForecast open_forecast = engine.analyze_and_predict_horizon(tick.open, pending_order->step1_dist, cfg.forecast_horizon, entry_gap);
 
-                    const auto&          acc = exchange.account();
+                    const auto&          acc = broker->account();
                     const PortfolioState open_portfolio{
                             .equity                = acc.equity(tick.open),
                             .position_shares       = acc.position_shares,
@@ -162,7 +190,7 @@ void run_simulation(const EngineConfig& cfg)
                         execute_at_open = false;
                         if (open_decision.should_flatten && acc.position_shares != 0.0)
                         {
-                            const auto fill = exchange.close_position(tick.datetime, tick.open);
+                            const auto fill = broker->close_position(tick.datetime, tick.open);
                             log_close_fill("RISK FLATTEN EXIT   ", fill);
                             bars_held = 0;
                         }
@@ -175,13 +203,13 @@ void run_simulation(const EngineConfig& cfg)
 
                 if (execute_at_open)
                 {
-                    const double      shares_before = exchange.account().position_shares;
-                    const std::size_t fills_before  = exchange.fills().size();
-                    (void) exchange.execute_order(pending_order->signal, tick.datetime, tick.open, exec_allocation);
+                    const double      shares_before = broker->account().position_shares;
+                    const std::size_t fills_before  = broker->fills().size();
+                    (void) broker->execute_order(pending_order->signal, tick.datetime, tick.open, exec_allocation);
 
-                    for (std::size_t f_idx = fills_before; f_idx < exchange.fills().size(); ++f_idx)
+                    for (std::size_t f_idx = fills_before; f_idx < broker->fills().size(); ++f_idx)
                     {
-                        const auto& fill   = exchange.fills()[f_idx];
+                        const auto& fill   = broker->fills()[f_idx];
                         const bool  is_buy = fill.side == OrderSignal::Buy;
                         const char* color  = is_buy ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
 
@@ -197,7 +225,7 @@ void run_simulation(const EngineConfig& cfg)
                         std::cout << "\n";
                     }
 
-                    const double shares_after = exchange.account().position_shares;
+                    const double shares_after = broker->account().position_shares;
                     if (shares_after == 0.0 || (shares_before <= 0.0 && shares_after > 0.0) || (shares_before >= 0.0 && shares_after < 0.0))
                     {
                         bars_held = 0;
@@ -209,33 +237,21 @@ void run_simulation(const EngineConfig& cfg)
             pending_flatten = false;
         }
 
-        // Stage 2 (Intra-Bar): Optional stop-loss / take-profit brackets
-        if (exchange.account().position_shares != 0.0)
+        // Stage 2 (Intra-Bar & Mark-to-Market): Venue bracket evaluation & equity update
+        if (broker->account().position_shares != 0.0)
         {
             ++bars_held;
-            const bool   is_long   = exchange.account().position_shares > 0.0;
-            const double entry_px  = exchange.account().avg_entry_price;
-            const double stop_px   = is_long ? entry_px * (1.0 - cfg.stop_loss_pct) : entry_px * (1.0 + cfg.stop_loss_pct);
-            const double target_px = is_long ? entry_px * (1.0 + cfg.take_profit_pct) : entry_px * (1.0 - cfg.take_profit_pct);
-
-            if (cfg.stop_loss_pct > 0.0 && ((is_long && tick.low <= stop_px) || (!is_long && tick.high >= stop_px)))
+            const auto bracket_fill = broker->on_bar_update(tick, cfg.stop_loss_pct, cfg.take_profit_pct);
+            if (bracket_fill.closed_position)
             {
-                const double fill_px = is_long ? std::min(tick.open, stop_px) : std::max(tick.open, stop_px);
-                const auto   fill    = exchange.close_position(tick.datetime, fill_px);
-                log_close_fill("INTRA-BAR STOP EXIT ", fill);
-                bars_held = 0;
-            }
-            else if (cfg.take_profit_pct > 0.0 && ((is_long && tick.high >= target_px) || (!is_long && tick.low <= target_px)))
-            {
-                const double fill_px = is_long ? std::max(tick.open, target_px) : std::min(tick.open, target_px);
-                const auto   fill    = exchange.close_position(tick.datetime, fill_px);
-                log_close_fill("INTRA-BAR TP EXIT   ", fill);
+                log_close_fill("INTRA-BAR BRACKET   ", bracket_fill);
                 bars_held = 0;
             }
         }
         else
         {
             bars_held = 0;
+            (void) broker->on_bar_update(tick, 0.0, 0.0);
         }
 
         // Stage 3 (Bar Close): Causal walk-forward update & signal generation
@@ -246,7 +262,7 @@ void run_simulation(const EngineConfig& cfg)
             current_distribution = engine.state_delta(state_idx);
             engine.evolve(current_distribution, next_distribution);
 
-            const auto&          acc = exchange.account();
+            const auto&          acc = broker->account();
             const PortfolioState portfolio{
                     .equity                = acc.equity(tick.close),
                     .position_shares       = acc.position_shares,
@@ -275,10 +291,10 @@ void run_simulation(const EngineConfig& cfg)
             {
                 const double target_alloc = cfg.dynamic_sizing ? decision.max_allowed_allocation_pct : cfg.allocation_pct;
                 pending_order             = PendingOrder{
-                                    .signal             = decision.signal,
-                                    .signal_close_price = tick.close,
-                                    .allocation_pct     = target_alloc,
-                                    .step1_dist         = next_distribution,
+                        .signal             = decision.signal,
+                        .signal_close_price = tick.close,
+                        .allocation_pct     = target_alloc,
+                        .step1_dist         = next_distribution,
                 };
                 pending_flatten = false;
             }
@@ -303,29 +319,24 @@ void run_simulation(const EngineConfig& cfg)
                 bars_since_recal = 0;
             }
         }
-
-        exchange.update_tick(tick.close);
     }
 
     // Liquidate any remaining open position at the final known close for accounting.
-    if (!market.empty() && exchange.account().position_shares != 0.0)
+    if (has_first_oos_bar && broker->account().position_shares != 0.0)
     {
-        const auto& last_tick = market.bars().back();
-        const auto  fill      = exchange.close_position(last_tick.datetime, last_tick.close);
+        const auto fill = broker->close_position(last_tick.datetime, last_tick.close);
         log_close_fill("END-OF-DATA FLATTEN ", fill);
-        exchange.update_tick(last_tick.close);
+        (void) broker->on_bar_update(last_tick, 0.0, 0.0);
     }
 
     // Output Portfolio PnL & Performance Metrics
-    const auto&  acc             = exchange.account();
-    const double start_oos_price = market[train_size].close;
-    const double final_price     = market.bars().back().close;
-    const double buy_hold_pct    = ((final_price / start_oos_price) - 1.0) * 100.0;
-
+    const auto&  acc           = broker->account();
+    const double final_price   = last_tick.close;
+    const double buy_hold_pct  = (start_oos_price > 0.0) ? (((final_price / start_oos_price) - 1.0) * 100.0) : 0.0;
     const double final_equity  = acc.equity(final_price);
     const double total_pnl     = final_equity - initial_cash;
     const double return_pct    = (total_pnl / initial_cash) * 100.0;
-    const double sharpe        = exchange.sharpe_ratio();
+    const double sharpe        = broker->sharpe_ratio();
     const double win_rate      = (acc.total_trades > 0) ? (static_cast<double>(acc.winning_trades) / acc.total_trades * 100.0) : 0.0;
     const double profit_factor = acc.profit_factor();
     const double payoff_ratio  = acc.payoff_ratio();

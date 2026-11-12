@@ -1,18 +1,11 @@
 #pragma once
 
+#include "quant/core/types.hpp"
 #include "quant/models/interfaces.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <string>
-
-enum class OrderSignal
-{
-    Hold,
-    Buy,  // Target long exposure
-    Sell, // Target short exposure
-    Close // Exit existing position to flat (alpha fade / time stop)
-};
 
 struct PortfolioState
 {
@@ -123,10 +116,10 @@ public:
         const bool strong_alpha_buy  = (forecast.expected_return > limits_.min_expected_return) && (forecast.prob_positive_return >= limits_.min_bullish_prob);
         const bool strong_alpha_sell = (forecast.expected_return < -limits_.min_expected_return) && (forecast.prob_positive_return <= limits_.max_bearish_prob);
 
-        const bool alpha_exit_long = (decision.current_side == PositionSide::Long) && (forecast.expected_return < limits_.exit_expected_return) &&
-                                     (forecast.prob_positive_return <= limits_.max_bearish_prob);
-        const bool alpha_exit_short = (decision.current_side == PositionSide::Short) && (forecast.expected_return > -limits_.exit_expected_return) &&
-                                      (forecast.prob_positive_return >= limits_.min_bullish_prob);
+        const bool  alpha_exit_long  = (decision.current_side == PositionSide::Long) && (forecast.expected_return < limits_.exit_expected_return) &&
+                                       (forecast.prob_positive_return <= limits_.max_bearish_prob);
+        const bool  alpha_exit_short = (decision.current_side == PositionSide::Short) && (forecast.expected_return > -limits_.exit_expected_return) &&
+                                       (forecast.prob_positive_return >= limits_.min_bullish_prob);
         OrderSignal candidate_signal = OrderSignal::Hold;
         if (strong_alpha_buy)
         {
@@ -287,8 +280,8 @@ public:
             decision.signal    = OrderSignal::Hold;
             decision.risk_veto = true;
             decision.reason    = std::string("VETO [") + side_str + "]: Portfolio VaR(95%) loss " + std::to_string(decision.portfolio_var_95 * 100.0) + "% (unit " +
-                              std::to_string(decision.unit_var_95 * 100.0) + "% @ " + std::to_string(gross_weight * 100.0) + "% exposure) exceeds max limit " +
-                              std::to_string(var_limit * 100.0) + "%";
+                                 std::to_string(decision.unit_var_95 * 100.0) + "% @ " + std::to_string(gross_weight * 100.0) + "% exposure) exceeds max limit " +
+                                 std::to_string(var_limit * 100.0) + "%";
             return decision;
         }
 
@@ -297,8 +290,8 @@ public:
             decision.signal    = OrderSignal::Hold;
             decision.risk_veto = true;
             decision.reason    = std::string("VETO [") + side_str + "]: Portfolio CVaR(95%) loss " + std::to_string(decision.portfolio_cvar_95 * 100.0) + "% (unit " +
-                              std::to_string(decision.unit_cvar_95 * 100.0) + "% @ " + std::to_string(gross_weight * 100.0) + "% exposure) exceeds max limit " +
-                              std::to_string(cvar_limit * 100.0) + "%";
+                                 std::to_string(decision.unit_cvar_95 * 100.0) + "% @ " + std::to_string(gross_weight * 100.0) + "% exposure) exceeds max limit " +
+                                 std::to_string(cvar_limit * 100.0) + "%";
             return decision;
         }
 
@@ -307,16 +300,16 @@ public:
             decision.signal        = OrderSignal::Buy;
             decision.return_passed = true;
             decision.reason        = "BUY/LONG PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) > hurdle, P(r>0) (" +
-                              std::to_string(forecast.prob_positive_return * 100.0) + "%), Port VaR(95%)=" + std::to_string(decision.portfolio_var_95 * 100.0) +
-                              "%, Port CVaR(95%)=" + std::to_string(decision.portfolio_cvar_95 * 100.0) + "%";
+                                     std::to_string(forecast.prob_positive_return * 100.0) + "%), Port VaR(95%)=" + std::to_string(decision.portfolio_var_95 * 100.0) +
+                                     "%, Port CVaR(95%)=" + std::to_string(decision.portfolio_cvar_95 * 100.0) + "%";
         }
         else if (candidate_signal == OrderSignal::Sell)
         {
             decision.signal        = OrderSignal::Sell;
             decision.return_passed = true;
             decision.reason        = "SELL/SHORT PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) < -hurdle, P(r>0) (" +
-                              std::to_string(forecast.prob_positive_return * 100.0) + "%), Port VaR(95%)=" + std::to_string(decision.portfolio_var_95 * 100.0) +
-                              "%, Port CVaR(95%)=" + std::to_string(decision.portfolio_cvar_95 * 100.0) + "%";
+                                     std::to_string(forecast.prob_positive_return * 100.0) + "%), Port VaR(95%)=" + std::to_string(decision.portfolio_var_95 * 100.0) +
+                                     "%, Port CVaR(95%)=" + std::to_string(decision.portfolio_cvar_95 * 100.0) + "%";
         }
         else if (candidate_signal == OrderSignal::Close)
         {

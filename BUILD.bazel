@@ -1,24 +1,17 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
-cc_binary(
-    name = "quant",
+cc_library(
+    name = "app_support",
+    hdrs = [
+        "include/quant/core/config.hpp",
+        "include/quant/telemetry/console_reporter.hpp",
+    ],
+    includes = ["include"],
     deps = [
-       "//include/quant:quant_lib",
-    ],
-    srcs = [
-        "quant.cpp"
-    ],
-    copts = [
-        "-std=c++20",
-        "-O3",
-        "-march=native",
-    ],
-    data = [
-        "//:quant.env",
+        "@kinetic_model",
     ],
 )
 
-# new live API simulation & backtest executable
 cc_binary(
     name = "sim_runner",
     srcs = ["sim_runner.cpp"],
@@ -31,6 +24,9 @@ cc_binary(
         "//:quant.env",
     ],
     deps = [
-        "//include/quant:quant_lib",
+        ":app_support",
+        "@execution_simulator",
+        "@kinetic_model",
+        "@market_simulator",
     ],
 )
