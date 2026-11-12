@@ -4,7 +4,7 @@
 #include "quant/core/types.hpp"
 #include "quant/data/csv_reader.hpp"
 #include "quant/features/feature_engine.hpp"
-#include "quant/models/empirical_kernel.hpp"
+#include "quant/models/kernels.hpp"
 #include "quant/models/kinetic_model.hpp"
 #include "quant/risk/risk_manager.hpp"
 #include "quant/telemetry/console_reporter.hpp"
