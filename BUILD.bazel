@@ -8,6 +8,7 @@ cc_library(
     ],
     includes = ["include"],
     deps = [
+        "@execution_simulator",
         "@kinetic_model",
     ],
 )

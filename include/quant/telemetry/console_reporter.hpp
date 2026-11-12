@@ -1,6 +1,7 @@
 #pragma once
 
 #include "quant/core/matrix.hpp"
+#include "quant/execution/execution_gateway.hpp"
 #include "quant/models/interfaces.hpp"
 #include "quant/risk/risk_manager.hpp"
 
@@ -159,6 +160,63 @@ public:
         std::cout << "  " << RED << BOLD << "Sell Signals Executed [SELL]  : " << sells << RESET << "\n";
         std::cout << "  " << YELLOW << "Hold Decisions [HOLD]         : " << holds << RESET << "\n";
         std::cout << "  " << MAGENTA << "Risk Limits Vetoed Trades     : " << risk_rejections << RESET << "\n";
+        std::cout << CYAN << "========================================================================================================\n" << RESET;
+    }
+
+    static void print_close_fill(const char* label, const ExecutionFill& fill)
+    {
+        if (!fill.closed_position)
+            return;
+
+        const char* pnl_color = fill.realized_pnl >= 0.0 ? GREEN : RED;
+        std::cout << GRAY << "[" << fill.timestamp << "] " << RESET << YELLOW << BOLD << label << RESET << " | Shares: " << fill.shares << " @ $" << std::fixed
+                  << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid << " | Realized PnL: " << pnl_color << BOLD << "$"
+                  << fill.realized_pnl << RESET << "\n";
+    }
+
+    static void print_execution_fill(const ExecutionFill& fill)
+    {
+        const bool  is_buy = fill.side == OrderSignal::Buy;
+        const char* color  = is_buy ? GREEN : RED;
+
+        std::cout << GRAY << "[" << fill.timestamp << "] " << RESET << color << BOLD << (is_buy ? "EXECUTED BUY/COVER " : "EXECUTED SELL/SHORT") << RESET
+                  << " | Shares: " << fill.shares << " @ $" << std::fixed << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $"
+                  << fill.fee_paid;
+
+        if (fill.closed_position)
+        {
+            const char* pnl_color = fill.realized_pnl >= 0.0 ? GREEN : RED;
+            std::cout << " | Realized PnL: " << pnl_color << BOLD << "$" << fill.realized_pnl << RESET;
+        }
+        std::cout << "\n";
+    }
+
+    static void print_account_performance(double initial_cash, double final_price, double start_oos_price, double sharpe, const AccountState& acc)
+    {
+        const double buy_hold_pct  = (start_oos_price > 0.0) ? (((final_price / start_oos_price) - 1.0) * 100.0) : 0.0;
+        const double final_equity  = acc.equity(final_price);
+        const double total_pnl     = final_equity - initial_cash;
+        const double return_pct    = (total_pnl / initial_cash) * 100.0;
+        const double win_rate      = (acc.total_trades > 0) ? (static_cast<double>(acc.winning_trades) / acc.total_trades * 100.0) : 0.0;
+        const double profit_factor = acc.profit_factor();
+        const double payoff_ratio  = acc.payoff_ratio();
+        const double expectancy    = acc.expectancy_per_trade();
+
+        render_header("SIMULATED ACCOUNT PERFORMANCE & P&L STATEMENT");
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "  Initial Starting Capital     : $" << initial_cash << "\n";
+        std::cout << "  Final Account Equity         : $" << final_equity << "\n";
+        std::cout << "  Net Realized Profit / Loss   : " << (total_pnl >= 0 ? GREEN : RED) << BOLD << "$" << total_pnl << " (" << return_pct << "%)" << RESET << "\n";
+        std::cout << "  Out-of-Sample Buy & Hold     : " << (buy_hold_pct >= 0 ? GREEN : RED) << buy_hold_pct << "%" << RESET << " (Benchmark)\n";
+        std::cout << "  Total Exchange Fees Paid     : " << YELLOW << "$" << acc.total_fees_paid << RESET << " (Slippage & Commission)\n";
+        std::cout << "  Max Equity Drawdown          : " << RED << (acc.max_drawdown * 100.0) << "%" << RESET << "\n";
+        std::cout << "  Completed Round-Trip Trades  : " << acc.total_trades << " (Wins: " << acc.winning_trades << " | Losses: " << acc.losing_trades << ")\n";
+        std::cout << "  Strategy Win Rate            : " << (win_rate >= 50.0 ? GREEN : YELLOW) << win_rate << "%" << RESET << "\n";
+        std::cout << "  Avg Win / Avg Loss (Payoff)  : " << GREEN << "$" << acc.avg_win() << RESET << " / " << RED << "$" << acc.avg_loss() << RESET << " (" << std::setprecision(2)
+                  << payoff_ratio << ":1)\n";
+        std::cout << "  Profit Factor (Gross W/L)    : " << (profit_factor >= 1.2 ? GREEN : YELLOW) << std::setprecision(2) << profit_factor << RESET << "\n";
+        std::cout << "  Net Expectancy per Trade     : " << (expectancy >= 0.0 ? GREEN : RED) << "$" << std::setprecision(2) << expectancy << RESET << "\n";
+        std::cout << "  Annualized Sharpe Ratio      : " << (sharpe >= 1.0 ? GREEN : YELLOW) << std::setprecision(3) << sharpe << RESET << "\n";
         std::cout << CYAN << "========================================================================================================\n" << RESET;
     }
 };

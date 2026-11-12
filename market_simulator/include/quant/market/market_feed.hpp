@@ -76,9 +76,9 @@ public:
     }
 
     // Backpressure-aware push for CSV replay threads (never drops bars when queue is full)
-    void push_blocking(const Tick& tick) noexcept
+    void push_blocking(const Tick& tick, std::stop_token stoken = {}) noexcept
     {
-        while (!push_tick(tick))
+        while (!stoken.stop_requested() && !push_tick(tick))
         {
             std::this_thread::yield();
         }
