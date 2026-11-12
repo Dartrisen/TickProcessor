@@ -4,6 +4,7 @@
 #include "quant/execution/execution_gateway.hpp"
 #include "quant/models/interfaces.hpp"
 #include "quant/risk/risk_manager.hpp"
+#include "quant/session/session_observer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,8 +12,9 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <string_view>
 
-class QuantConsoleReporter
+class QuantConsoleReporter final : public ISessionObserver
 {
 public:
     // ANSI Color Escape Codes
@@ -26,14 +28,34 @@ public:
     static constexpr const char* GRAY    = "\033[1;30m";
     static constexpr const char* WHITE   = "\033[1;37m";
 
-    static void render_header(const std::string& title)
+    void on_session_start() override
+    {
+        render_header("ORDER GATEWAY & TRADE EXECUTION STREAM");
+    }
+
+    void on_close_fill(std::string_view label, const ExecutionFill& fill) override
+    {
+        print_close_fill(label, fill);
+    }
+
+    void on_execution_fill(const ExecutionFill& fill) override
+    {
+        print_execution_fill(fill);
+    }
+
+    void on_session_end(const SessionSummary& summary, const AccountState& acc) override
+    {
+        print_account_performance(summary.initial_capital, summary.final_price, summary.start_price, summary.sharpe_ratio, acc);
+    }
+
+    static void render_header(std::string_view title)
     {
         std::cout << "\n" << CYAN << "========================================================================================================\n";
         std::cout << "  " << BOLD << WHITE << title << RESET << CYAN << "\n";
         std::cout << "========================================================================================================\n" << RESET;
     }
 
-    static void print_signal_event(const std::string& timestamp, double price, const SignalDecision& decision, const QuantForecast& forecast)
+    static void print_signal_event(std::string_view timestamp, double price, const SignalDecision& decision, const QuantForecast& forecast)
     {
         std::cout << std::fixed << std::setprecision(4);
 
@@ -92,7 +114,7 @@ public:
     }
 
     template <std::size_t Bins>
-    static void print_distribution_ascii(double dx, double x_max, const std::array<double, Bins>& dist, const std::string& label)
+    static void print_distribution_ascii(double dx, double x_max, const std::array<double, Bins>& dist, std::string_view label)
     {
         std::cout << "\n" << BOLD << WHITE << "--- Density Distribution: " << label << " ---" << RESET << "\n";
         constexpr std::size_t max_bar_width = 40;
@@ -163,13 +185,13 @@ public:
         std::cout << CYAN << "========================================================================================================\n" << RESET;
     }
 
-    static void print_close_fill(const char* label, const ExecutionFill& fill)
+    static void print_close_fill(std::string_view label, const ExecutionFill& fill)
     {
         if (!fill.closed_position)
             return;
 
         const char* pnl_color = fill.realized_pnl >= 0.0 ? GREEN : RED;
-        std::cout << GRAY << "[" << fill.timestamp << "] " << RESET << YELLOW << BOLD << label << RESET << " | Shares: " << fill.shares << " @ $" << std::fixed
+        std::cout << GRAY << "[" << fill.timestamp.view() << "] " << RESET << YELLOW << BOLD << label << RESET << " | Shares: " << fill.shares << " @ $" << std::fixed
                   << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid << " | Realized PnL: " << pnl_color << BOLD << "$"
                   << fill.realized_pnl << RESET << "\n";
     }
@@ -179,7 +201,7 @@ public:
         const bool  is_buy = fill.side == OrderSignal::Buy;
         const char* color  = is_buy ? GREEN : RED;
 
-        std::cout << GRAY << "[" << fill.timestamp << "] " << RESET << color << BOLD << (is_buy ? "EXECUTED BUY/COVER " : "EXECUTED SELL/SHORT") << RESET
+        std::cout << GRAY << "[" << fill.timestamp.view() << "] " << RESET << color << BOLD << (is_buy ? "EXECUTED BUY/COVER " : "EXECUTED SELL/SHORT") << RESET
                   << " | Shares: " << fill.shares << " @ $" << std::fixed << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $"
                   << fill.fee_paid;
 

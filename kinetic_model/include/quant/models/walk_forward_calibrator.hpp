@@ -6,9 +6,9 @@
 #include "quant/models/kernels.hpp"
 #include "quant/models/kinetic_model.hpp"
 
+#include <array>
 #include <concepts>
 #include <cstddef>
-#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -16,16 +16,13 @@
 template <std::size_t Bins, template <std::size_t> class KernelT = EmpiricalKernel>
 class WalkForwardCalibrator
 {
-    static_assert(std::derived_from<KernelT<Bins>, ITransitionKernel<Bins>>,
-                  "KernelT<Bins> must inherit from ITransitionKernel<Bins>");
+    static_assert(std::derived_from<KernelT<Bins>, ITransitionKernel<Bins>>, "KernelT<Bins> must inherit from ITransitionKernel<Bins>");
 
 public:
     static constexpr std::size_t DefaultRecalibrationBars = 390;
 
     explicit WalkForwardCalibrator(std::size_t recalibration_interval = DefaultRecalibrationBars, KernelT<Bins> builder = {})
-        : recalibration_interval_(recalibration_interval)
-        , kernel_(std::make_unique<FlatMatrix<double, Bins>>())
-        , builder_(std::move(builder))
+            : recalibration_interval_(recalibration_interval), builder_(std::move(builder))
     {
     }
 
@@ -42,7 +39,7 @@ public:
     {
         rolling_features_.push_back(feat);
 
-        if (++bars_since_recal_ >= recalibration_interval_ && rolling_features_.size() >= calibration_window_)
+        if (recalibration_interval_ > 0 && ++bars_since_recal_ >= recalibration_interval_ && rolling_features_.size() >= calibration_window_)
         {
             rebuild_and_swap(engine);
             bars_since_recal_ = 0;
@@ -52,18 +49,19 @@ public:
 private:
     void rebuild_and_swap(HighPerformanceKineticEngine<Bins>& engine)
     {
-        const std::span<const DerivedFeatures> trailing_slice(
-                rolling_features_.data() + (rolling_features_.size() - calibration_window_),
-                calibration_window_);
+        const std::span<const DerivedFeatures> trailing_slice(rolling_features_.data() + (rolling_features_.size() - calibration_window_), calibration_window_);
 
-        builder_.build_kernel(engine.dx(), engine.x_max(), trailing_slice, *kernel_);
-        engine.update_kernel(kernel_.get());
+        auto& next_buffer = buffers_[write_index_];
+        builder_.build_kernel(engine.dx(), engine.x_max(), trailing_slice, next_buffer);
+        engine.update_kernel(&next_buffer);
+        write_index_ ^= 1;
     }
 
-    std::size_t                               recalibration_interval_;
-    std::unique_ptr<FlatMatrix<double, Bins>> kernel_;
-    KernelT<Bins>                             builder_;
-    std::vector<DerivedFeatures>              rolling_features_{};
-    std::size_t                               calibration_window_{0};
-    std::size_t                               bars_since_recal_{0};
+    std::size_t                             recalibration_interval_;
+    std::array<FlatMatrix<double, Bins>, 2> buffers_{};
+    std::size_t                             write_index_{0};
+    KernelT<Bins>                           builder_;
+    std::vector<DerivedFeatures>            rolling_features_{};
+    std::size_t                             calibration_window_{0};
+    std::size_t                             bars_since_recal_{0};
 };

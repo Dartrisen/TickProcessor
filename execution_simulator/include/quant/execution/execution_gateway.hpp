@@ -3,7 +3,6 @@
 #include "quant/core/types.hpp"
 
 #include <cstddef>
-#include <string>
 #include <vector>
 
 struct FeeStructure
@@ -15,8 +14,8 @@ struct FeeStructure
 
 struct ExecutionFill
 {
-    std::string timestamp{};
-    OrderSignal side{OrderSignal::Hold};
+    FixedTimestamp timestamp{};
+    OrderSignal    side{OrderSignal::Hold};
 
     double fill_price{0.0};
     double shares{0.0};
@@ -103,9 +102,8 @@ class IExecutionGateway
 public:
     virtual ~IExecutionGateway() = default;
 
-    virtual ExecutionFill execute_order(OrderSignal signal, std::string timestamp, double current_price, double allocation_pct = 0.95) = 0;
-
-    virtual ExecutionFill close_position(std::string timestamp, double current_price) = 0;
+    virtual ExecutionFill execute_order(OrderSignal signal, FixedTimestamp timestamp, double current_price, double allocation_pct = 0.95) = 0;
+    virtual ExecutionFill close_position(FixedTimestamp timestamp, double current_price)                                                  = 0;
 
     // Evaluates venue-side protective brackets (SL/TP) on incoming bar updates and marks equity to market.
     // Returns a closing ExecutionFill if a bracket triggered; otherwise returns an empty fill.

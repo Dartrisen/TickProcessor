@@ -1,12 +1,11 @@
 #pragma once
 
+#include "quant/core/dispatch_table.hpp"
 #include "quant/risk/risk_manager.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -15,11 +14,13 @@
 struct EngineConfig
 {
     // Model & Feature parameters
+    KernelType  kernel_type{KernelType::Empirical};
     std::size_t bins{16};
     double      x_max{0.015};
     std::size_t volatility_window{20};
     double      train_split_ratio{0.70};
     std::size_t forecast_horizon{3};
+    std::size_t recalibration_bars{390};
     std::size_t min_hold_bars{1};
     std::size_t max_hold_bars{0}; // 0 = disabled (let positions run until exit signal or risk limit)
     bool        recheck_at_open{true};
@@ -28,7 +29,7 @@ struct EngineConfig
     double      take_profit_pct{0.0};
 
     // Risk Engine parameters
-    RiskLimits  risk_limits{};
+    RiskLimits risk_limits{};
 
     // Exchange Simulation parameters
     double initial_capital{10000.0};
@@ -36,10 +37,10 @@ struct EngineConfig
     double commission_rate{0.0001};
     double fixed_fee{0.00};
     double slippage_bps{0.0001};
+    double bars_per_year{98280.0};
 
     // Ingestion & Infrastructure
-    std::string data_path{"/Users/cdg546/Downloads/data/SPY_clean_1min.csv"};
-    std::size_t async_calibration_ms{500};
+    std::string data_path{"data/SPY_clean_1min.csv"};
 };
 
 class ConfigLoader
@@ -70,7 +71,6 @@ public:
                 std::string key   = std::string(trim(trimmed.substr(0, pos)));
                 std::string value = std::string(trim(trimmed.substr(pos + 1)));
 
-                // Strip inline comments if present
                 auto comment_pos = value.find('#');
                 if (comment_pos != std::string::npos)
                 {
@@ -86,7 +86,16 @@ public:
             throw std::runtime_error("Deprecated config key 'RISK_MIN_ENTROPY' found in " + env_filepath + ". Replace it with 'RISK_MAX_ENTROPY'.");
         }
 
-        // Parse key-value map into EngineConfig struct
+        if (auto it = kv.find("MODEL_KERNEL"); it != kv.end())
+        {
+            const auto parsed = DispatchLimits::parse_kernel(it->second);
+            if (!parsed.has_value())
+            {
+                throw std::runtime_error("Unsupported MODEL_KERNEL='" + it->second + "'. Supported values: empirical, gaussian, dirichlet, phase_space.");
+            }
+            cfg.kernel_type = *parsed;
+        }
+
         if (auto it = kv.find("MODEL_BINS"); it != kv.end())
             cfg.bins = std::stoull(it->second);
         if (auto it = kv.find("MODEL_X_MAX"); it != kv.end())
@@ -97,8 +106,8 @@ public:
             cfg.train_split_ratio = std::stod(it->second);
         if (auto it = kv.find("MODEL_FORECAST_HORIZON"); it != kv.end())
             cfg.forecast_horizon = std::stoull(it->second);
-        if (auto it = kv.find("RISK_MIN_HOLD_BARS"); it != kv.end())
-            cfg.min_hold_bars = std::stoull(it->second);
+        if (auto it = kv.find("MODEL_RECALIBRATION_BARS"); it != kv.end())
+            cfg.recalibration_bars = std::stoull(it->second);
         if (auto it = kv.find("RISK_MIN_HOLD_BARS"); it != kv.end())
             cfg.min_hold_bars = std::stoull(it->second);
         if (auto it = kv.find("RISK_MAX_HOLD_BARS"); it != kv.end())
@@ -144,20 +153,18 @@ public:
             cfg.fixed_fee = std::stod(it->second);
         if (auto it = kv.find("SIM_SLIPPAGE_BPS"); it != kv.end())
             cfg.slippage_bps = std::stod(it->second);
+        if (auto it = kv.find("SIM_BARS_PER_YEAR"); it != kv.end())
+            cfg.bars_per_year = std::stod(it->second);
 
         if (auto it = kv.find("DATA_PATH"); it != kv.end())
             cfg.data_path = it->second;
-        if (auto it = kv.find("ASYNC_CALIBRATION_MS"); it != kv.end())
-            cfg.async_calibration_ms = std::stoull(it->second);
 
-        // Validate compile-time template buckets and parameter bounds
-        if (cfg.bins != 8 && cfg.bins != 12 && cfg.bins != 16 && cfg.bins != 24 && cfg.bins != 32 && cfg.bins != 64)
+        if (!DispatchLimits::is_supported_bin(cfg.bins))
         {
             throw std::runtime_error("MODEL_BINS=" + std::to_string(cfg.bins) + " is not in the compiled template dispatch table. Supported values: 8, 12, 16, 24, 32, 64.");
         }
 
-        if (cfg.volatility_window != 10 && cfg.volatility_window != 14 && cfg.volatility_window != 20 && cfg.volatility_window != 30 && cfg.volatility_window != 50 &&
-            cfg.volatility_window != 60)
+        if (!DispatchLimits::is_supported_window(cfg.volatility_window))
         {
             throw std::runtime_error("FEATURE_VOLATILITY_WINDOW=" + std::to_string(cfg.volatility_window) +
                                      " is not in the compiled template dispatch table. Supported values: 10, 14, 20, 30, 50, 60.");
@@ -172,14 +179,17 @@ public:
         if (cfg.allocation_pct <= 0.0 || cfg.allocation_pct > 1.0)
             throw std::runtime_error("SIM_ALLOCATION_PCT must be in (0, 1].");
 
+        if (cfg.bars_per_year <= 0.0)
+            throw std::runtime_error("SIM_BARS_PER_YEAR must be positive.");
+
         if (cfg.risk_limits.max_var_95 < 0.0)
             throw std::runtime_error("RISK_MAX_VAR_95 must be non-negative.");
 
         if (cfg.risk_limits.max_entropy < 0.0)
             throw std::runtime_error("RISK_MAX_ENTROPY must be non-negative.");
 
-        std::cout << "\033[1;32m[+] ConfigLoader: Loaded runtime parameters from '" << env_filepath << "' (BINS=" << cfg.bins << ", VOL_WIN=" << cfg.volatility_window
-                  << ").\033[0m\n";
+        std::cout << "\033[1;32m[+] ConfigLoader: Loaded runtime parameters from '" << env_filepath << "' (KERNEL=" << DispatchLimits::kernel_name(cfg.kernel_type)
+                  << ", BINS=" << cfg.bins << ", VOL_WIN=" << cfg.volatility_window << ").\033[0m\n";
         return cfg;
     }
 

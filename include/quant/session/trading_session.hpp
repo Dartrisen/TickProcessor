@@ -8,23 +8,24 @@
 #include "quant/models/kinetic_model.hpp"
 #include "quant/models/walk_forward_calibrator.hpp"
 #include "quant/risk/risk_manager.hpp"
-#include "quant/telemetry/console_reporter.hpp"
+#include "quant/session/session_observer.hpp"
 
 #include <cmath>
 #include <cstddef>
 #include <optional>
 #include <span>
-#include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 template <std::size_t BINS, std::size_t VOL_WINDOW, template <std::size_t> class KernelT = EmpiricalKernel>
 class KineticTradingSession
 {
 public:
-    KineticTradingSession(const EngineConfig& cfg, IExecutionGateway& broker, KernelT<BINS> kernel_builder = {})
-            : cfg_(cfg), broker_(broker), engine_(cfg.x_max), calibrator_(WalkForwardCalibrator<BINS, KernelT>::DefaultRecalibrationBars, std::move(kernel_builder)),
-              risk_engine_(cfg.risk_limits), current_dist_(engine_.initial_uniform_distribution())
+    KineticTradingSession(const EngineConfig& cfg, IExecutionGateway& broker, ISessionObserver& observer = default_observer(), KernelT<BINS> kernel_builder = {})
+            : cfg_(cfg), broker_(broker), observer_(observer), engine_(cfg.x_max), calibrator_(cfg.recalibration_bars, std::move(kernel_builder)), risk_engine_(cfg.risk_limits),
+              current_dist_(engine_.initial_uniform_distribution())
     {
     }
 
@@ -47,7 +48,7 @@ public:
 
     void run(IMarketDataFeed& feed)
     {
-        QuantConsoleReporter::render_header("ORDER GATEWAY & TRADE EXECUTION STREAM");
+        observer_.on_session_start();
 
         bool   has_first_bar = false;
         double start_price   = 0.0;
@@ -80,7 +81,14 @@ public:
             (void) broker_.on_bar_update(last_tick, 0.0, 0.0);
         }
 
-        QuantConsoleReporter::print_account_performance(cfg_.initial_capital, last_tick.close, start_price, broker_.sharpe_ratio(), broker_.account());
+        observer_.on_session_end(
+                SessionSummary{
+                        .initial_capital = cfg_.initial_capital,
+                        .start_price     = start_price,
+                        .final_price     = last_tick.close,
+                        .sharpe_ratio    = broker_.sharpe_ratio(),
+                },
+                broker_.account());
     }
 
 private:
@@ -94,6 +102,12 @@ private:
         double      allocation_pct{0.0};
         StateVector step1_dist{};
     };
+
+    static NullSessionObserver& default_observer() noexcept
+    {
+        static NullSessionObserver instance{};
+        return instance;
+    }
 
     [[nodiscard]] bool has_open_position() const noexcept
     {
@@ -112,13 +126,13 @@ private:
         };
     }
 
-    void flatten_position(const std::string& timestamp, double price, const char* label)
+    void flatten_position(FixedTimestamp timestamp, double price, std::string_view label)
     {
         if (!has_open_position())
             return;
 
         const auto fill = broker_.close_position(timestamp, price);
-        QuantConsoleReporter::print_close_fill(label, fill);
+        observer_.on_close_fill(label, fill);
         bars_held_ = 0;
     }
 
@@ -186,7 +200,7 @@ private:
 
         for (std::size_t idx = fills_before; idx < broker_.fills().size(); ++idx)
         {
-            QuantConsoleReporter::print_execution_fill(broker_.fills()[idx]);
+            observer_.on_execution_fill(broker_.fills()[idx]);
         }
 
         const double shares_after = broker_.account().position_shares;
@@ -209,7 +223,7 @@ private:
         const auto bracket_fill = broker_.on_bar_update(tick, cfg_.stop_loss_pct, cfg_.take_profit_pct);
         if (bracket_fill.closed_position)
         {
-            QuantConsoleReporter::print_close_fill("INTRA-BAR BRACKET   ", bracket_fill);
+            observer_.on_close_fill("INTRA-BAR BRACKET   ", bracket_fill);
             bars_held_ = 0;
         }
     }
@@ -260,6 +274,7 @@ private:
 
     const EngineConfig&                  cfg_;
     IExecutionGateway&                   broker_;
+    ISessionObserver&                    observer_;
     KineticEngine                        engine_;
     WalkForwardCalibrator<BINS, KernelT> calibrator_;
     OnlineFeatureEngine<VOL_WINDOW>      feature_engine_{};

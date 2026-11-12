@@ -1,7 +1,9 @@
 #include "quant/core/config.hpp"
+#include "quant/core/dispatch_table.hpp"
 #include "quant/execution/simulated_exchange.hpp"
 #include "quant/market/csv_reader.hpp"
 #include "quant/market/market_feed.hpp"
+#include "quant/models/kernels.hpp"
 #include "quant/session/trading_session.hpp"
 #include "quant/telemetry/console_reporter.hpp"
 
@@ -9,10 +11,11 @@
 #include <iostream>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <utility>
 
-template <std::size_t BINS, std::size_t VOL_WINDOW>
+template <template <std::size_t> class KernelT, std::size_t BINS, std::size_t VOL_WINDOW>
 void run_simulation(const EngineConfig& cfg)
 {
     const FeeStructure fees{
@@ -20,7 +23,7 @@ void run_simulation(const EngineConfig& cfg)
             .fixed_fee_per_trade = cfg.fixed_fee,
             .slippage_bps        = cfg.slippage_bps,
     };
-    SimulatedExchange broker(cfg.initial_capital, fees);
+    SimulatedExchange broker(cfg.initial_capital, fees, cfg.bars_per_year);
 
     std::cout << "[+] Connecting to market feed: " << QuantConsoleReporter::CYAN << cfg.data_path << QuantConsoleReporter::RESET << " ...\n";
     const MarketDataset dataset = CsvReader::load(cfg.data_path);
@@ -33,13 +36,11 @@ void run_simulation(const EngineConfig& cfg)
     const auto        warmup_bars = dataset.bars().subspan(0, train_size);
     const auto        oos_bars    = dataset.bars().subspan(train_size);
 
-    LiveRingBufferFeed<4096> feed(dataset[0].source);
+    LiveRingBufferFeed<4096> feed(std::string(dataset.source()));
 
     std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << dataset.size() << QuantConsoleReporter::RESET << " total ticks (Source: " << feed.source_name()
               << " | In-Sample Calibration: " << warmup_bars.size() << " | Out-of-Sample Test: " << oos_bars.size() << ").\n";
 
-    // Producer thread pushing ticks into the lock-free ring buffer.
-    // For live trading, replace this thread with your broker callback calling feed.push_tick(tick).
     std::jthread csv_producer(
             [&feed, oos_bars](std::stop_token stoken)
             {
@@ -52,22 +53,41 @@ void run_simulation(const EngineConfig& cfg)
                 feed.mark_exhausted();
             });
 
-    KineticTradingSession<BINS, VOL_WINDOW> session(cfg, broker);
+    QuantConsoleReporter                             reporter;
+    KineticTradingSession<BINS, VOL_WINDOW, KernelT> session(cfg, broker, reporter);
     session.warmup(warmup_bars);
     session.run(feed);
 }
 
-template <std::size_t BINS, std::size_t... Windows>
-bool try_dispatch_window(const EngineConfig& cfg, std::index_sequence<Windows...>)
+template <template <std::size_t> class KernelT, std::size_t BINS, std::size_t... Idx>
+bool try_dispatch_window_indices(const EngineConfig& cfg, std::index_sequence<Idx...>)
 {
-    return ((cfg.volatility_window == Windows ? (run_simulation<BINS, Windows>(cfg), true) : false) || ...);
+    return ((cfg.volatility_window == DispatchLimits::Windows[Idx] ? (run_simulation<KernelT, BINS, DispatchLimits::Windows[Idx]>(cfg), true) : false) || ...);
 }
 
-template <std::size_t... Bins>
+template <template <std::size_t> class KernelT, std::size_t... Bins>
 bool try_dispatch_bins(const EngineConfig& cfg, std::index_sequence<Bins...>)
 {
-    using SupportedWindows = std::index_sequence<10, 14, 20, 30, 50, 60>;
-    return ((cfg.bins == Bins ? try_dispatch_window<Bins>(cfg, SupportedWindows{}) : false) || ...);
+    using WindowIndices = std::make_index_sequence<DispatchLimits::Windows.size()>;
+    return ((cfg.bins == Bins ? try_dispatch_window_indices<KernelT, Bins>(cfg, WindowIndices{}) : false) || ...);
+}
+
+template <std::size_t... Idx>
+bool dispatch_simulation(const EngineConfig& cfg, std::index_sequence<Idx...>)
+{
+    using BinSeq = std::index_sequence<DispatchLimits::Bins[Idx]...>;
+    switch (cfg.kernel_type)
+    {
+        case KernelType::Empirical:
+            return try_dispatch_bins<EmpiricalKernel>(cfg, BinSeq{});
+        case KernelType::Gaussian:
+            return try_dispatch_bins<GaussianDiffusionKernel>(cfg, BinSeq{});
+        case KernelType::Dirichlet:
+            return try_dispatch_bins<AdaptiveDirichletKernel>(cfg, BinSeq{});
+        case KernelType::PhaseSpace:
+            return try_dispatch_bins<FactorizedPhaseSpaceKernel>(cfg, BinSeq{});
+    }
+    return false;
 }
 
 int main()
@@ -77,10 +97,9 @@ int main()
         QuantConsoleReporter::render_header("LIVE API BACKTEST & PAPER TRADING SIMULATION ENGINE");
         const EngineConfig cfg = ConfigLoader::load("quant.env");
 
-        using SupportedBins = std::index_sequence<8, 12, 16, 24, 32, 64>;
-        if (!try_dispatch_bins(cfg, SupportedBins{}))
+        if (!dispatch_simulation(cfg, std::make_index_sequence<DispatchLimits::Bins.size()>{}))
         {
-            throw std::runtime_error("Unsupported MODEL_BINS or FEATURE_VOLATILITY_WINDOW.");
+            throw std::runtime_error("Unsupported MODEL_KERNEL, MODEL_BINS, or FEATURE_VOLATILITY_WINDOW.");
         }
     }
     catch (const std::exception& e)
