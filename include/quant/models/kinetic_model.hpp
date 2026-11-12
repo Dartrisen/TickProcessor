@@ -108,8 +108,6 @@ public:
                 entropy -= p * std::log2(p);
         }
 
-        // Defensive normalization if a future kernel implementation produces
-        // a nearly-normalized vector rather than an exact probability vector.
         if (total_probability <= 1e-12)
             return forecast;
 
@@ -136,54 +134,90 @@ public:
             variance += p * diff * diff;
         }
 
-        auto return_quantile = [&](double probability) noexcept
+        // Left-tail quantile (accumulated from lowest return bin upward)
+        auto lower_return_quantile = [&](double tail_prob) noexcept
         {
             double cumulative = 0.0;
 
             for (std::size_t i = 0; i < Bins; ++i)
             {
                 cumulative += std::max(0.0, dist[i]) / total_probability;
-                if (cumulative >= probability)
+                if (cumulative >= tail_prob)
                     return bin_center(i);
             }
 
             return bin_center(Bins - 1);
         };
 
-        // Average log-return in the worst 5% tail, including a fractional
-        // contribution from the bin that crosses the 5% probability boundary.
-        constexpr double tail_probability           = 0.05;
-        double           remaining_tail_probability = tail_probability;
-        double           tail_return_sum            = 0.0;
-
-        for (std::size_t i = 0; i < Bins && remaining_tail_probability > 1e-12; ++i)
+        // Right-tail quantile (accumulated from highest return bin downward)
+        auto upper_return_quantile = [&](double tail_prob) noexcept
         {
-            const double p                = std::max(0.0, dist[i]) / total_probability;
-            const double used_probability = std::min(p, remaining_tail_probability);
+            double cumulative = 0.0;
 
-            tail_return_sum += used_probability * bin_center(i);
-            remaining_tail_probability -= used_probability;
+            for (std::size_t k = 0; k < Bins; ++k)
+            {
+                const std::size_t idx = Bins - 1 - k;
+                cumulative += std::max(0.0, dist[idx]) / total_probability;
+                if (cumulative >= tail_prob)
+                    return bin_center(idx);
+            }
+
+            return bin_center(0);
+        };
+
+        constexpr double tail_probability = 0.05;
+
+        // 1. Long-side tail risk (worst 5% downside returns)
+        double lower_remaining_prob  = tail_probability;
+        double lower_tail_return_sum = 0.0;
+
+        for (std::size_t i = 0; i < Bins && lower_remaining_prob > 1e-12; ++i)
+        {
+            const double p         = std::max(0.0, dist[i]) / total_probability;
+            const double used_prob = std::min(p, lower_remaining_prob);
+
+            lower_tail_return_sum += used_prob * bin_center(i);
+            lower_remaining_prob -= used_prob;
         }
 
-        const double q025 = return_quantile(0.025);
-        const double q05  = return_quantile(0.05);
-        const double q975 = return_quantile(0.975);
+        // 2. Short-side tail risk (worst 5% upside returns)
+        double upper_remaining_prob  = tail_probability;
+        double upper_tail_return_sum = 0.0;
+
+        for (std::size_t k = 0; k < Bins && upper_remaining_prob > 1e-12; ++k)
+        {
+            const std::size_t idx       = Bins - 1 - k;
+            const double      p         = std::max(0.0, dist[idx]) / total_probability;
+            const double      used_prob = std::min(p, upper_remaining_prob);
+
+            upper_tail_return_sum += used_prob * bin_center(idx);
+            upper_remaining_prob -= used_prob;
+        }
+
+        const double q025 = lower_return_quantile(0.025);
+        const double q05  = lower_return_quantile(0.05);
+        const double q95  = upper_return_quantile(0.05);
+        const double q975 = upper_return_quantile(0.025);
 
         forecast.expected_return      = mean_log_return;
         forecast.expected_volatility  = std::sqrt(std::max(0.0, variance));
         forecast.prob_positive_return = prob_positive;
         forecast.distribution_entropy = entropy;
 
-        // Arithmetic expectation: E[P(t+1)] = P(t) * sum(p_i * exp(r_i)).
         forecast.expected_price = current_price * expected_price_multiplier;
         forecast.mode_price     = current_price * std::exp(bin_center(mode_index));
 
         forecast.price_ci_lower_95 = current_price * std::exp(q025);
         forecast.price_ci_upper_95 = current_price * std::exp(q975);
 
-        // Store VaR/CVaR as POSITIVE loss magnitudes, not negative returns.
-        forecast.var_95  = std::max(0.0, -q05);
-        forecast.cvar_95 = std::max(0.0, -(tail_return_sum / tail_probability));
+        // Positive loss magnitudes for both position directions
+        forecast.long_var_95   = std::max(0.0, -q05);
+        forecast.long_cvar_95  = std::max(0.0, -(lower_tail_return_sum / tail_probability));
+        forecast.short_var_95  = std::max(0.0, q95);
+        forecast.short_cvar_95 = std::max(0.0, upper_tail_return_sum / tail_probability);
+
+        forecast.var_95  = forecast.long_var_95;
+        forecast.cvar_95 = forecast.long_cvar_95;
 
         return forecast;
     }

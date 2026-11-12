@@ -10,6 +10,7 @@
 #include "quant/risk/risk_manager.hpp"
 #include "quant/telemetry/console_reporter.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -39,7 +40,7 @@ void run_simulation(const EngineConfig& cfg)
     }
     catch (const std::exception&)
     {
-        std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing. Please provide a valid market data file.\n" << QuantConsoleReporter::RESET;
+        std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing. Please ensure the data file is available.\n" << QuantConsoleReporter::RESET;
         return 1;
     }
 
@@ -78,26 +79,40 @@ void run_simulation(const EngineConfig& cfg)
     engine.update_kernel(kernel.get());
 
     // Out-of-Sample Live Pipeline Components
-    RiskEngine                 risk_engine(cfg.risk_limits);
+    RiskEngine                          risk_engine(cfg.risk_limits);
     typename KineticEngine::StateVector current_distribution = engine.initial_uniform_distribution();
     typename KineticEngine::StateVector next_distribution{};
 
     QuantConsoleReporter::render_header("SIMULATED ORDER GATEWAY & LIVE TRADE EXECUTION STREAM");
 
-    // Signal is generated after observing a completed bar close.
-    // It is intentionally executed only at the NEXT bar's open.
+    // Signals and risk-flatten directives are generated after observing a completed
+    // bar close and executed only at the NEXT bar's open.
     std::optional<OrderSignal> pending_signal;
+    bool                       pending_flatten{false};
 
     for (std::size_t i = train_size; i < total_bars; ++i)
     {
         const auto& tick = market[i];
 
         // -----------------------------------------------------------------
-        // Execute only a decision that was generated from the PREVIOUS
-        // completed bar. This avoids using tick.close to both create the
-        // signal and fill at that same close.
+        // Execute only a decision generated from the PREVIOUS completed bar.
+        // This avoids using tick.close to both create the signal and fill at
+        // that same close.
         // -----------------------------------------------------------------
-        if (pending_signal.has_value())
+        if (pending_flatten && exchange.account().position_shares != 0.0)
+        {
+            const auto  fill      = exchange.close_position(tick.datetime, tick.open);
+            const char* pnl_color = fill.realized_pnl >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
+
+            std::cout << QuantConsoleReporter::GRAY << "[" << fill.timestamp << "] " << QuantConsoleReporter::RESET << QuantConsoleReporter::YELLOW << QuantConsoleReporter::BOLD
+                      << "RISK FLATTEN EXIT   " << QuantConsoleReporter::RESET << " | Shares: " << fill.shares << " @ $" << std::fixed << std::setprecision(2) << fill.fill_price
+                      << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid << " | Realized PnL: " << pnl_color << QuantConsoleReporter::BOLD << "$"
+                      << fill.realized_pnl << QuantConsoleReporter::RESET << "\n";
+
+            pending_flatten = false;
+            pending_signal.reset();
+        }
+        else if (pending_signal.has_value())
         {
             const std::size_t fills_before = exchange.fills().size();
             (void) exchange.execute_order(*pending_signal, tick.datetime, tick.open, cfg.allocation_pct);
@@ -123,11 +138,12 @@ void run_simulation(const EngineConfig& cfg)
             }
 
             pending_signal.reset();
+            pending_flatten = false;
         }
 
         // -----------------------------------------------------------------
-        // At bar close, compute features and create the signal that may
-        // be executed at the following bar's open.
+        // At bar close, compute features, evaluate portfolio-aware risk,
+        // and schedule any entry, reversal, or flatten for the next bar open.
         // -----------------------------------------------------------------
         if (feature_engine.process(tick, feat))
         {
@@ -136,12 +152,27 @@ void run_simulation(const EngineConfig& cfg)
             current_distribution = engine.state_delta(state_idx);
             engine.evolve(current_distribution, next_distribution);
 
+            const auto&          acc = exchange.account();
+            const PortfolioState portfolio{
+                    .equity                = acc.equity(tick.close),
+                    .position_shares       = acc.position_shares,
+                    .current_price         = tick.close,
+                    .target_allocation_pct = cfg.allocation_pct,
+                    .allow_pyramiding      = false,
+            };
+
             const QuantForecast  forecast = engine.analyze_and_predict(tick.close, next_distribution);
-            const SignalDecision decision = risk_engine.evaluate(forecast);
+            const SignalDecision decision = risk_engine.evaluate(forecast, portfolio);
 
             if (decision.signal == OrderSignal::Buy || decision.signal == OrderSignal::Sell)
             {
-                pending_signal = decision.signal;
+                pending_signal  = decision.signal;
+                pending_flatten = false;
+            }
+            else if (decision.should_flatten)
+            {
+                pending_flatten = true;
+                pending_signal.reset();
             }
         }
 
@@ -180,22 +211,21 @@ void run_simulation(const EngineConfig& cfg)
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  Initial Starting Capital     : $" << initial_cash << "\n";
     std::cout << "  Final Account Equity         : $" << final_equity << "\n";
-    std::cout << "  Net Realized Profit / Loss   : " << (total_pnl >= 0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED) << QuantConsoleReporter::BOLD << "$"
-              << total_pnl << " (" << return_pct << "%)" << QuantConsoleReporter::RESET << "\n";
+    std::cout << "  Net Realized Profit / Loss   : " << (total_pnl >= 0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED) << QuantConsoleReporter::BOLD << "$" << total_pnl
+              << " (" << return_pct << "%)" << QuantConsoleReporter::RESET << "\n";
     std::cout << "  Out-of-Sample Buy & Hold     : " << (buy_hold_pct >= 0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED) << buy_hold_pct << "%"
               << QuantConsoleReporter::RESET << " (Benchmark)\n";
-    std::cout << "  Total Exchange Fees Paid     : " << QuantConsoleReporter::YELLOW << "$" << acc.total_fees_paid << QuantConsoleReporter::RESET
-              << " (Slippage & Commission)\n";
+    std::cout << "  Total Exchange Fees Paid     : " << QuantConsoleReporter::YELLOW << "$" << acc.total_fees_paid << QuantConsoleReporter::RESET << " (Slippage & Commission)\n";
     std::cout << "  Max Equity Drawdown          : " << QuantConsoleReporter::RED << (acc.max_drawdown * 100.0) << "%" << QuantConsoleReporter::RESET << "\n";
     std::cout << "  Completed Round-Trip Trades  : " << acc.total_trades << " (Wins: " << acc.winning_trades << " | Losses: " << acc.losing_trades << ")\n";
     std::cout << "  Strategy Win Rate            : " << (win_rate >= 50.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::YELLOW) << win_rate << "%"
               << QuantConsoleReporter::RESET << "\n";
-    std::cout << "  Avg Win / Avg Loss (Payoff)  : " << QuantConsoleReporter::GREEN << "$" << acc.avg_win() << QuantConsoleReporter::RESET << " / "
-              << QuantConsoleReporter::RED << "$" << acc.avg_loss() << QuantConsoleReporter::RESET << " (" << std::setprecision(2) << payoff_ratio << ":1)\n";
-    std::cout << "  Profit Factor (Gross W/L)    : " << (profit_factor >= 1.2 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::YELLOW) << std::setprecision(2)
-              << profit_factor << QuantConsoleReporter::RESET << "\n";
-    std::cout << "  Net Expectancy per Trade     : " << (expectancy >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED) << "$" << std::setprecision(2)
-              << expectancy << QuantConsoleReporter::RESET << "\n";
+    std::cout << "  Avg Win / Avg Loss (Payoff)  : " << QuantConsoleReporter::GREEN << "$" << acc.avg_win() << QuantConsoleReporter::RESET << " / " << QuantConsoleReporter::RED
+              << "$" << acc.avg_loss() << QuantConsoleReporter::RESET << " (" << std::setprecision(2) << payoff_ratio << ":1)\n";
+    std::cout << "  Profit Factor (Gross W/L)    : " << (profit_factor >= 1.2 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::YELLOW) << std::setprecision(2) << profit_factor
+              << QuantConsoleReporter::RESET << "\n";
+    std::cout << "  Net Expectancy per Trade     : " << (expectancy >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED) << "$" << std::setprecision(2) << expectancy
+              << QuantConsoleReporter::RESET << "\n";
     std::cout << "  Annualized Sharpe Ratio      : " << (sharpe >= 1.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::YELLOW) << std::setprecision(3) << sharpe
               << QuantConsoleReporter::RESET << "\n";
     std::cout << QuantConsoleReporter::CYAN << "========================================================================================================\n"

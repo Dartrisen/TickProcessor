@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -44,15 +45,27 @@ public:
         {
             signal_tag = std::string(RED) + BOLD + "[SIGNAL: SELL]" + RESET;
         }
+        else if (decision.should_flatten)
+        {
+            signal_tag = std::string(MAGENTA) + BOLD + "[SIGNAL: EXIT]" + RESET;
+        }
         else
         {
             signal_tag = std::string(YELLOW) + BOLD + "[SIGNAL: HOLD]" + RESET;
         }
 
-        std::cout << GRAY << "[" << timestamp << "] " << RESET << signal_tag << " Price: " << BOLD << "$" << price << RESET
-                  << " | E[r]: " << (forecast.expected_return >= 0 ? GREEN : RED) << (forecast.expected_return * 100.0) << "%" << RESET
-                  << " | P(r>0): " << (forecast.prob_positive_return > 0.5 ? GREEN : RED) << (forecast.prob_positive_return * 100.0) << "%" << RESET
-                  << " | VaR(95): " << (decision.var_passed ? GREEN : RED) << (forecast.var_95 * 100.0) << "%" << RESET << "\n  " << GRAY << "└─► Reason: " << WHITE
+        const char* side_label = (decision.candidate_side == PositionSide::Long) ? "LONG" : ((decision.candidate_side == PositionSide::Short) ? "SHORT" : "FLAT");
+
+        const bool   has_side_risk = (decision.candidate_side != PositionSide::Flat);
+        const double display_var   = has_side_risk ? decision.portfolio_var_95 : forecast.var_95;
+        const double display_cvar  = has_side_risk ? decision.portfolio_cvar_95 : forecast.cvar_95;
+        const double exposure_pct  = std::abs(decision.post_trade_exposure_weight) * 100.0;
+
+        std::cout << GRAY << "[" << timestamp << "] " << RESET << signal_tag << " [" << CYAN << side_label << RESET << " @ " << std::setprecision(1) << exposure_pct << "%] "
+                  << std::setprecision(4) << "Price: " << BOLD << "$" << price << RESET << " | E[r]: " << (forecast.expected_return >= 0 ? GREEN : RED)
+                  << (forecast.expected_return * 100.0) << "%" << RESET << " | P(r>0): " << (forecast.prob_positive_return > 0.5 ? GREEN : RED)
+                  << (forecast.prob_positive_return * 100.0) << "%" << RESET << " | VaR(95): " << (decision.var_passed ? GREEN : RED) << (display_var * 100.0) << "%" << RESET
+                  << " | CVaR(95): " << (decision.cvar_passed ? GREEN : RED) << (display_cvar * 100.0) << "%" << RESET << "\n  " << GRAY << "└─► Reason: " << WHITE
                   << decision.reason << RESET << "\n";
     }
 
@@ -71,8 +84,8 @@ public:
         std::cout << GRAY << "--------------------------------------------------------------------------------------------------------\n" << RESET;
         std::cout << "  Expected Volatility (σ)   : " << YELLOW << (f.expected_volatility * 100.0) << "%" << RESET << "\n";
         std::cout << "  Bullish Probability P(r>0): " << (f.prob_positive_return >= 0.5 ? GREEN : RED) << (f.prob_positive_return * 100.0) << "%" << RESET << "\n";
-        std::cout << "  Value at Risk (95% VaR)   : " << RED << (f.var_95 * 100.0) << "% log-loss" << RESET << "\n";
-        std::cout << "  Expected Shortfall (CVaR) : " << RED << (f.cvar_95 * 100.0) << "% expected tail loss" << RESET << "\n";
+        std::cout << "  Long VaR / CVaR (95%)     : " << RED << (f.long_var_95 * 100.0) << "% / " << (f.long_cvar_95 * 100.0) << "% downside loss" << RESET << "\n";
+        std::cout << "  Short VaR / CVaR (95%)    : " << RED << (f.short_var_95 * 100.0) << "% / " << (f.short_cvar_95 * 100.0) << "% upside loss" << RESET << "\n";
         std::cout << "  Kinetic Entropy (Uncert.) : " << MAGENTA << f.distribution_entropy << " bits" << RESET << "\n";
         std::cout << CYAN << "+------------------------------------------------------------------------------------------------------+\n" << RESET;
     }

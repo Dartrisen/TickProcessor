@@ -91,6 +91,12 @@ public:
 
         if (auto it = kv.find("RISK_MAX_VAR_95"); it != kv.end())
             cfg.risk_limits.max_var_95 = std::stod(it->second);
+        if (auto it = kv.find("RISK_MAX_CVAR_95"); it != kv.end())
+            cfg.risk_limits.max_cvar_95 = std::stod(it->second);
+        if (auto it = kv.find("RISK_SHORT_MAX_VAR_95"); it != kv.end())
+            cfg.risk_limits.short_max_var_95 = std::stod(it->second);
+        if (auto it = kv.find("RISK_SHORT_MAX_CVAR_95"); it != kv.end())
+            cfg.risk_limits.short_max_cvar_95 = std::stod(it->second);
         if (auto it = kv.find("RISK_MAX_ENTROPY"); it != kv.end())
             cfg.risk_limits.max_entropy = std::stod(it->second);
         if (auto it = kv.find("RISK_MIN_EXPECTED_RETURN"); it != kv.end())
