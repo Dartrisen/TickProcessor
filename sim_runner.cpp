@@ -38,10 +38,9 @@ void run_simulation(const EngineConfig& cfg)
     {
         market = CsvReader::load(cfg.data_path);
     }
-    catch (const std::exception&)
+    catch (const std::exception& e)
     {
-        std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing. Please ensure the data file is available.\n" << QuantConsoleReporter::RESET;
-        return 1;
+        throw std::runtime_error("Failed to load market data from '" + cfg.data_path + "': " + e.what());
     }
 
     const std::size_t total_bars = market.size();
@@ -67,8 +66,8 @@ void run_simulation(const EngineConfig& cfg)
         }
     }
 
-    std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << total_bars << QuantConsoleReporter::RESET << " total ticks (In-Sample Calibration: " << train_size
-              << " | Out-of-Sample Test: " << (total_bars - train_size) << ").\n";
+    std::cout << "[+] Loaded " << QuantConsoleReporter::BOLD << total_bars << QuantConsoleReporter::RESET << " total ticks (Source: " << market[0].source
+              << " | In-Sample Calibration: " << train_size << " | Out-of-Sample Test: " << (total_bars - train_size) << ").\n";
 
     // Setup Kinetic Strategy Engine & Calibrate Baseline Kernel on Training Slice
     KineticEngine engine(cfg.x_max);
@@ -85,66 +84,161 @@ void run_simulation(const EngineConfig& cfg)
 
     QuantConsoleReporter::render_header("SIMULATED ORDER GATEWAY & LIVE TRADE EXECUTION STREAM");
 
-    // Signals and risk-flatten directives are generated after observing a completed
-    // bar close and executed only at the NEXT bar's open.
-    std::optional<OrderSignal> pending_signal;
-    bool                       pending_flatten{false};
+    // Maintain a trailing feature window for causal walk-forward recalibration
+    std::vector<DerivedFeatures> rolling_features   = train_features;
+    const std::size_t            calibration_window = train_features.size();
+    std::size_t                  bars_since_recal   = 0;
+
+    struct PendingOrder
+    {
+        OrderSignal                         signal{OrderSignal::Hold};
+        double                              signal_close_price{0.0};
+        double                              allocation_pct{0.0};
+        typename KineticEngine::StateVector step1_dist{};
+    };
+
+    std::optional<PendingOrder> pending_order;
+    bool                        pending_flatten{false};
+    std::size_t                 bars_held{0};
+
+    auto log_close_fill = [](const char* label, const ExecutionFill& fill)
+    {
+        if (!fill.closed_position)
+            return;
+
+        const char* pnl_color = fill.realized_pnl >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
+        std::cout << QuantConsoleReporter::GRAY << "[" << fill.timestamp << "] " << QuantConsoleReporter::RESET << QuantConsoleReporter::YELLOW << QuantConsoleReporter::BOLD
+                  << label << QuantConsoleReporter::RESET << " | Shares: " << fill.shares << " @ $" << std::fixed << std::setprecision(2) << fill.fill_price << " | Value: $"
+                  << fill.trade_value << " | Fee: $" << fill.fee_paid << " | Realized PnL: " << pnl_color << QuantConsoleReporter::BOLD << "$" << fill.realized_pnl
+                  << QuantConsoleReporter::RESET << "\n";
+    };
 
     for (std::size_t i = train_size; i < total_bars; ++i)
     {
         const auto& tick = market[i];
 
-        // -----------------------------------------------------------------
-        // Execute only a decision generated from the PREVIOUS completed bar.
-        // This avoids using tick.close to both create the signal and fill at
-        // that same close.
-        // -----------------------------------------------------------------
+        // Stage 1 (Bar Open): Execute protective flattens or validated open orders
         if (pending_flatten && exchange.account().position_shares != 0.0)
         {
-            const auto  fill      = exchange.close_position(tick.datetime, tick.open);
-            const char* pnl_color = fill.realized_pnl >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
-
-            std::cout << QuantConsoleReporter::GRAY << "[" << fill.timestamp << "] " << QuantConsoleReporter::RESET << QuantConsoleReporter::YELLOW << QuantConsoleReporter::BOLD
-                      << "RISK FLATTEN EXIT   " << QuantConsoleReporter::RESET << " | Shares: " << fill.shares << " @ $" << std::fixed << std::setprecision(2) << fill.fill_price
-                      << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid << " | Realized PnL: " << pnl_color << QuantConsoleReporter::BOLD << "$"
-                      << fill.realized_pnl << QuantConsoleReporter::RESET << "\n";
-
+            const auto fill = exchange.close_position(tick.datetime, tick.open);
+            log_close_fill("RISK FLATTEN EXIT   ", fill);
+            bars_held       = 0;
             pending_flatten = false;
-            pending_signal.reset();
+            pending_order.reset();
         }
-        else if (pending_signal.has_value())
+        else if (pending_order.has_value())
         {
-            const std::size_t fills_before = exchange.fills().size();
-            (void) exchange.execute_order(*pending_signal, tick.datetime, tick.open, cfg.allocation_pct);
-
-            // Log every fill generated by this request (handles both single entries and reversals)
-            for (std::size_t f_idx = fills_before; f_idx < exchange.fills().size(); ++f_idx)
+            if (pending_order->signal == OrderSignal::Close)
             {
-                const auto& fill   = exchange.fills()[f_idx];
-                const bool  is_buy = fill.side == OrderSignal::Buy;
-                const char* color  = is_buy ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
-
-                std::cout << QuantConsoleReporter::GRAY << "[" << fill.timestamp << "] " << QuantConsoleReporter::RESET << color << QuantConsoleReporter::BOLD
-                          << (is_buy ? "EXECUTED BUY/COVER " : "EXECUTED SELL/SHORT") << QuantConsoleReporter::RESET << " | Shares: " << fill.shares << " @ $" << std::fixed
-                          << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid;
-
-                if (fill.closed_position)
+                if (exchange.account().position_shares != 0.0)
                 {
-                    const char* pnl_color = fill.realized_pnl >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
-                    std::cout << " | Realized PnL: " << pnl_color << QuantConsoleReporter::BOLD << "$" << fill.realized_pnl << QuantConsoleReporter::RESET;
+                    const auto fill = exchange.close_position(tick.datetime, tick.open);
+                    log_close_fill("EXECUTED EXIT/CLOSE ", fill);
+                    bars_held = 0;
+                }
+            }
+            else
+            {
+                bool   execute_at_open = true;
+                double exec_allocation = pending_order->allocation_pct;
+
+                if (cfg.recheck_at_open && pending_order->signal_close_price > 0.0 && tick.open > 0.0)
+                {
+                    const double        entry_gap     = std::log(tick.open / pending_order->signal_close_price);
+                    const QuantForecast open_forecast = engine.analyze_and_predict_horizon(tick.open, pending_order->step1_dist, cfg.forecast_horizon, entry_gap);
+
+                    const auto&          acc = exchange.account();
+                    const PortfolioState open_portfolio{
+                            .equity                = acc.equity(tick.open),
+                            .position_shares       = acc.position_shares,
+                            .current_price         = tick.open,
+                            .target_allocation_pct = cfg.allocation_pct,
+                            .allow_pyramiding      = false,
+                    };
+
+                    const SignalDecision open_decision = risk_engine.evaluate(open_forecast, open_portfolio);
+                    if (open_decision.signal != pending_order->signal)
+                    {
+                        execute_at_open = false;
+                        if (open_decision.should_flatten && acc.position_shares != 0.0)
+                        {
+                            const auto fill = exchange.close_position(tick.datetime, tick.open);
+                            log_close_fill("RISK FLATTEN EXIT   ", fill);
+                            bars_held = 0;
+                        }
+                    }
+                    else if (cfg.dynamic_sizing)
+                    {
+                        exec_allocation = open_decision.max_allowed_allocation_pct;
+                    }
                 }
 
-                std::cout << "\n";
+                if (execute_at_open)
+                {
+                    const double      shares_before = exchange.account().position_shares;
+                    const std::size_t fills_before  = exchange.fills().size();
+                    (void) exchange.execute_order(pending_order->signal, tick.datetime, tick.open, exec_allocation);
+
+                    for (std::size_t f_idx = fills_before; f_idx < exchange.fills().size(); ++f_idx)
+                    {
+                        const auto& fill   = exchange.fills()[f_idx];
+                        const bool  is_buy = fill.side == OrderSignal::Buy;
+                        const char* color  = is_buy ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
+
+                        std::cout << QuantConsoleReporter::GRAY << "[" << fill.timestamp << "] " << QuantConsoleReporter::RESET << color << QuantConsoleReporter::BOLD
+                                  << (is_buy ? "EXECUTED BUY/COVER " : "EXECUTED SELL/SHORT") << QuantConsoleReporter::RESET << " | Shares: " << fill.shares << " @ $" << std::fixed
+                                  << std::setprecision(2) << fill.fill_price << " | Value: $" << fill.trade_value << " | Fee: $" << fill.fee_paid;
+
+                        if (fill.closed_position)
+                        {
+                            const char* pnl_color = fill.realized_pnl >= 0.0 ? QuantConsoleReporter::GREEN : QuantConsoleReporter::RED;
+                            std::cout << " | Realized PnL: " << pnl_color << QuantConsoleReporter::BOLD << "$" << fill.realized_pnl << QuantConsoleReporter::RESET;
+                        }
+                        std::cout << "\n";
+                    }
+
+                    const double shares_after = exchange.account().position_shares;
+                    if (shares_after == 0.0 || (shares_before <= 0.0 && shares_after > 0.0) || (shares_before >= 0.0 && shares_after < 0.0))
+                    {
+                        bars_held = 0;
+                    }
+                }
             }
 
-            pending_signal.reset();
+            pending_order.reset();
             pending_flatten = false;
         }
 
-        // -----------------------------------------------------------------
-        // At bar close, compute features, evaluate portfolio-aware risk,
-        // and schedule any entry, reversal, or flatten for the next bar open.
-        // -----------------------------------------------------------------
+        // Stage 2 (Intra-Bar): Optional stop-loss / take-profit brackets
+        if (exchange.account().position_shares != 0.0)
+        {
+            ++bars_held;
+            const bool   is_long   = exchange.account().position_shares > 0.0;
+            const double entry_px  = exchange.account().avg_entry_price;
+            const double stop_px   = is_long ? entry_px * (1.0 - cfg.stop_loss_pct) : entry_px * (1.0 + cfg.stop_loss_pct);
+            const double target_px = is_long ? entry_px * (1.0 + cfg.take_profit_pct) : entry_px * (1.0 - cfg.take_profit_pct);
+
+            if (cfg.stop_loss_pct > 0.0 && ((is_long && tick.low <= stop_px) || (!is_long && tick.high >= stop_px)))
+            {
+                const double fill_px = is_long ? std::min(tick.open, stop_px) : std::max(tick.open, stop_px);
+                const auto   fill    = exchange.close_position(tick.datetime, fill_px);
+                log_close_fill("INTRA-BAR STOP EXIT ", fill);
+                bars_held = 0;
+            }
+            else if (cfg.take_profit_pct > 0.0 && ((is_long && tick.high >= target_px) || (!is_long && tick.low <= target_px)))
+            {
+                const double fill_px = is_long ? std::max(tick.open, target_px) : std::min(tick.open, target_px);
+                const auto   fill    = exchange.close_position(tick.datetime, fill_px);
+                log_close_fill("INTRA-BAR TP EXIT   ", fill);
+                bars_held = 0;
+            }
+        }
+        else
+        {
+            bars_held = 0;
+        }
+
+        // Stage 3 (Bar Close): Causal walk-forward update & signal generation
         if (feature_engine.process(tick, feat))
         {
             const std::size_t state_idx = engine.state_index(feat.log_return);
@@ -161,34 +255,64 @@ void run_simulation(const EngineConfig& cfg)
                     .allow_pyramiding      = false,
             };
 
-            const QuantForecast  forecast = engine.analyze_and_predict(tick.close, next_distribution);
+            const QuantForecast  forecast = engine.analyze_and_predict_horizon(tick.close, next_distribution, cfg.forecast_horizon, 0.0);
             const SignalDecision decision = risk_engine.evaluate(forecast, portfolio);
 
-            if (decision.signal == OrderSignal::Buy || decision.signal == OrderSignal::Sell)
-            {
-                pending_signal  = decision.signal;
-                pending_flatten = false;
-            }
-            else if (decision.should_flatten)
+            const bool is_open_position  = (acc.position_shares != 0.0);
+            const bool inside_min_hold   = is_open_position && (bars_held < cfg.min_hold_bars);
+            const bool reached_time_stop = is_open_position && (cfg.max_hold_bars > 0) && (bars_held >= cfg.max_hold_bars);
+
+            if (decision.should_flatten)
             {
                 pending_flatten = true;
-                pending_signal.reset();
+                pending_order.reset();
+            }
+            else if (inside_min_hold)
+            {
+                pending_order.reset();
+            }
+            else if (decision.signal == OrderSignal::Buy || decision.signal == OrderSignal::Sell)
+            {
+                const double target_alloc = cfg.dynamic_sizing ? decision.max_allowed_allocation_pct : cfg.allocation_pct;
+                pending_order             = PendingOrder{
+                                    .signal             = decision.signal,
+                                    .signal_close_price = tick.close,
+                                    .allocation_pct     = target_alloc,
+                                    .step1_dist         = next_distribution,
+                };
+                pending_flatten = false;
+            }
+            else if (is_open_position && (decision.signal == OrderSignal::Close || reached_time_stop))
+            {
+                pending_order = PendingOrder{
+                        .signal             = OrderSignal::Close,
+                        .signal_close_price = tick.close,
+                        .allocation_pct     = 0.0,
+                        .step1_dist         = next_distribution,
+                };
+                pending_flatten = false;
+            }
+
+            // Append completed bar to rolling window and periodically recalibrate kernel (strictly causal)
+            rolling_features.push_back(feat);
+            if (++bars_since_recal >= 390 && rolling_features.size() >= calibration_window)
+            {
+                const std::span<const DerivedFeatures> trailing_slice(rolling_features.data() + (rolling_features.size() - calibration_window), calibration_window);
+                kernel_builder.build_kernel(engine.dx(), engine.x_max(), trailing_slice, *kernel);
+                engine.update_kernel(kernel.get());
+                bars_since_recal = 0;
             }
         }
 
-        // Record one marked equity value per completed bar.
         exchange.update_tick(tick.close);
     }
 
-    // A signal generated on the final close has no next-bar open and is
-    // intentionally NOT executed. Liquidate any existing position at the
-    // final known close for final accounting.
+    // Liquidate any remaining open position at the final known close for accounting.
     if (!market.empty() && exchange.account().position_shares != 0.0)
     {
         const auto& last_tick = market.bars().back();
-        exchange.close_position(last_tick.datetime, last_tick.close);
-
-        // Include final liquidation in drawdown and the equity curve.
+        const auto  fill      = exchange.close_position(last_tick.datetime, last_tick.close);
+        log_close_fill("END-OF-DATA FLATTEN ", fill);
         exchange.update_tick(last_tick.close);
     }
 

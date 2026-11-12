@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <string>
+#include <type_traits>
 #include <vector>
 
 struct FeeStructure
@@ -18,7 +18,7 @@ struct FeeStructure
 
 struct ExecutionFill
 {
-    std::string timestamp;
+    std::string timestamp{};
     OrderSignal side{OrderSignal::Hold};
 
     double fill_price{0.0};
@@ -26,8 +26,8 @@ struct ExecutionFill
     double trade_value{0.0};
     double fee_paid{0.0};
 
-    // Non-zero when an existing position was closed.
-    // Includes both entry and exit fees.
+    // Non-zero when an existing position (or partial slice) was closed.
+    // Includes proportional entry fee and exit fee.
     double realized_pnl{0.0};
 
     bool opened_position{false};
@@ -108,46 +108,124 @@ public:
         account_.peak_equity = initial_capital;
     }
 
-    // Buy means target a long position.
-    // Sell means target a short position.
-    //
-    // A reversal closes the existing position and opens the new position at
-    // the same simulated open price. Every individual fill is stored in
-    // fills_history_. The returned fill is the final action of this request.
-    ExecutionFill execute_order(OrderSignal signal, const std::string& timestamp, double current_price, double allocation_pct = 0.95)
+    // Buy targets long exposure (+allocation_pct), Sell targets short exposure (-allocation_pct),
+    // and Close flattens any open position to 0.
+    // Every individual fill is stored in fills_history_. The returned fill is the final action.
+    ExecutionFill execute_order(OrderSignal signal, std::string timestamp, double current_price, double allocation_pct = 0.95)
+    {
+        if (signal == OrderSignal::Hold || current_price <= 0.0)
+            return {};
+
+        if (signal == OrderSignal::Close)
+            return close_position(timestamp, current_price);
+
+        allocation_pct                 = std::clamp(allocation_pct, 0.0, 1.0);
+        const double target_signed_pct = (signal == OrderSignal::Buy) ? allocation_pct : -allocation_pct;
+        return rebalance_to_target(target_signed_pct, timestamp, current_price);
+    }
+
+    // Rebalances portfolio exposure to a signed equity fraction in [-1.0, +1.0].
+    // Supports opening from flat, flattening to 0, side reversals, scaling up, and partial trims.
+    ExecutionFill rebalance_to_target(double target_signed_pct, std::string timestamp, double current_price)
     {
         ExecutionFill result{};
-
-        if (signal == OrderSignal::Hold || current_price <= 0.0)
+        if (current_price <= 0.0)
             return result;
 
-        allocation_pct = std::clamp(allocation_pct, 0.0, 1.0);
+        target_signed_pct = std::clamp(target_signed_pct, -1.0, 1.0);
         update_drawdown(account_.equity(current_price));
 
-        if (signal == OrderSignal::Buy)
+        // Close existing position first if flipping sides or flattening to zero
+        if ((account_.position_shares > 0.0 && target_signed_pct <= 0.0) || (account_.position_shares < 0.0 && target_signed_pct >= 0.0))
         {
-            if (account_.position_shares < 0.0)
-                result = close_position(timestamp, current_price);
-
-            if (account_.position_shares == 0.0)
-                result = open_long(timestamp, current_price, allocation_pct);
-        }
-        else if (signal == OrderSignal::Sell)
-        {
-            if (account_.position_shares > 0.0)
-                result = close_position(timestamp, current_price);
-
-            if (account_.position_shares == 0.0)
-                result = open_short(timestamp, current_price, allocation_pct);
+            result = close_position(timestamp, current_price);
         }
 
-        // Equity is intentionally recorded only by update_tick(close).
-        // This keeps the equity curve close-to-close and the Sharpe
-        // annualization consistent with one observation per bar.
+        if (std::abs(target_signed_pct) <= 1e-9)
+            return result;
+
+        const double desired_shares = std::trunc((account_.equity(current_price) * target_signed_pct) / current_price);
+        const double delta_shares   = desired_shares - account_.position_shares;
+
+        if (std::abs(delta_shares) < 1.0)
+            return result;
+
+        if (account_.position_shares == 0.0)
+        {
+            return (desired_shares > 0.0) ? open_long(timestamp, current_price, std::abs(target_signed_pct)) : open_short(timestamp, current_price, std::abs(target_signed_pct));
+        }
+
+        // Same-side scale-in or partial trim
+        const bool   buying      = delta_shares > 0.0;
+        const double qty         = std::abs(delta_shares);
+        const double fill_price  = buying ? current_price * (1.0 + fees_.slippage_bps) : current_price * (1.0 - fees_.slippage_bps);
+        const double trade_value = qty * fill_price;
+        const double fee         = (trade_value * fees_.commission_rate) + fees_.fixed_fee_per_trade;
+        const bool   increasing  = std::abs(desired_shares) > std::abs(account_.position_shares);
+
+        if (increasing)
+        {
+            if (buying && account_.cash < trade_value + fee)
+                return result;
+
+            const double prev_abs    = std::abs(account_.position_shares);
+            const double new_abs     = prev_abs + qty;
+            account_.avg_entry_price = ((account_.avg_entry_price * prev_abs) + (fill_price * qty)) / new_abs;
+            account_.entry_fee_paid += fee;
+            account_.total_fees_paid += fee;
+            account_.cash += buying ? -(trade_value + fee) : (trade_value - fee);
+            account_.position_shares = desired_shares;
+
+            result.timestamp       = timestamp;
+            result.side            = buying ? OrderSignal::Buy : OrderSignal::Sell;
+            result.fill_price      = fill_price;
+            result.shares          = qty;
+            result.trade_value     = trade_value;
+            result.fee_paid        = fee;
+            result.opened_position = true;
+            fills_history_.push_back(result);
+        }
+        else
+        {
+            const bool   was_long  = account_.position_shares > 0.0;
+            const double prev_abs  = std::abs(account_.position_shares);
+            const double fee_share = account_.entry_fee_paid * (qty / prev_abs);
+            const double gross_pnl = was_long ? qty * (fill_price - account_.avg_entry_price) : qty * (account_.avg_entry_price - fill_price);
+            const double net_pnl   = gross_pnl - fee_share - fee;
+
+            account_.entry_fee_paid -= fee_share;
+            account_.total_fees_paid += fee;
+            account_.realized_pnl += net_pnl;
+            account_.cash += was_long ? (trade_value - fee) : -(trade_value + fee);
+            account_.position_shares = desired_shares;
+            account_.total_trades++;
+
+            if (net_pnl > 0.0)
+            {
+                account_.winning_trades++;
+                account_.gross_profit += net_pnl;
+            }
+            else if (net_pnl < 0.0)
+            {
+                account_.losing_trades++;
+                account_.gross_loss += std::abs(net_pnl);
+            }
+
+            result.timestamp       = timestamp;
+            result.side            = buying ? OrderSignal::Buy : OrderSignal::Sell;
+            result.fill_price      = fill_price;
+            result.shares          = qty;
+            result.trade_value     = trade_value;
+            result.fee_paid        = fee;
+            result.realized_pnl    = net_pnl;
+            result.closed_position = true;
+            fills_history_.push_back(result);
+        }
+
         return result;
     }
 
-    ExecutionFill close_position(const std::string& timestamp, double current_price)
+    ExecutionFill close_position(std::string timestamp, double current_price)
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;
@@ -282,7 +360,7 @@ public:
     }
 
 private:
-    ExecutionFill open_long(const std::string& timestamp, double current_price, double allocation_pct)
+    ExecutionFill open_long(std::string timestamp, double current_price, double allocation_pct)
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;
@@ -317,7 +395,7 @@ private:
         return fill;
     }
 
-    ExecutionFill open_short(const std::string& timestamp, double current_price, double allocation_pct)
+    ExecutionFill open_short(std::string timestamp, double current_price, double allocation_pct)
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;

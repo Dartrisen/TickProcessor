@@ -3,6 +3,7 @@
 #include "quant/core/matrix.hpp"
 #include "quant/core/types.hpp"
 
+#include <cstddef>
 #include <span>
 
 enum class PositionSide
@@ -14,6 +15,9 @@ enum class PositionSide
 
 struct QuantForecast
 {
+    std::size_t horizon_steps{1};
+    double      entry_gap_return{0.0};
+
     double current_price{0.0};
     double expected_price{0.0};
     double mode_price{0.0};

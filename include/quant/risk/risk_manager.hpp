@@ -9,8 +9,9 @@
 enum class OrderSignal
 {
     Hold,
-    Buy, // target long
-    Sell // target short
+    Buy,  // Target long exposure
+    Sell, // Target short exposure
+    Close // Exit existing position to flat (alpha fade / time stop)
 };
 
 struct PortfolioState
@@ -19,7 +20,7 @@ struct PortfolioState
     double position_shares{0.0};       // Current signed share count (+long, -short, 0 flat).
     double current_price{0.0};         // Mark price for exposure valuation (falls back to forecast.current_price if <= 0).
     double target_allocation_pct{1.0}; // Target equity allocation fraction for candidate position sizing in [0, 1].
-    bool   allow_pyramiding{false};    // False = single position per side; true = add target size to existing same-side exposure.
+    bool   allow_pyramiding{false};    // False = single target allocation per side; true = add target size to existing same-side exposure.
 };
 
 struct SignalDecision
@@ -71,6 +72,7 @@ struct RiskLimits
     double max_entropy{3.20};
 
     double min_expected_return{0.00005};
+    double exit_expected_return{0.0}; // Exit open position to flat when E[r] decays past this threshold
     double min_bullish_prob{0.52};
     double max_bearish_prob{0.48};
 
@@ -117,10 +119,14 @@ public:
             return decision;
         }
 
-        // 3. Determine candidate alpha side before selecting risk tail
+        // 3. Determine candidate alpha action (entry, reversal, or alpha-fade close) before selecting risk tail
         const bool strong_alpha_buy  = (forecast.expected_return > limits_.min_expected_return) && (forecast.prob_positive_return >= limits_.min_bullish_prob);
         const bool strong_alpha_sell = (forecast.expected_return < -limits_.min_expected_return) && (forecast.prob_positive_return <= limits_.max_bearish_prob);
 
+        const bool alpha_exit_long = (decision.current_side == PositionSide::Long) && (forecast.expected_return < limits_.exit_expected_return) &&
+                                     (forecast.prob_positive_return <= limits_.max_bearish_prob);
+        const bool alpha_exit_short = (decision.current_side == PositionSide::Short) && (forecast.expected_return > -limits_.exit_expected_return) &&
+                                      (forecast.prob_positive_return >= limits_.min_bullish_prob);
         OrderSignal candidate_signal = OrderSignal::Hold;
         if (strong_alpha_buy)
         {
@@ -132,8 +138,14 @@ public:
             candidate_signal        = OrderSignal::Sell;
             decision.candidate_side = PositionSide::Short;
         }
+        else if (alpha_exit_long || alpha_exit_short)
+        {
+            candidate_signal        = OrderSignal::Close;
+            decision.candidate_side = PositionSide::Flat;
+        }
         else
         {
+            candidate_signal        = OrderSignal::Hold;
             decision.candidate_side = decision.current_side;
         }
 
@@ -176,7 +188,12 @@ public:
         double post_notional = decision.current_exposure_notional;
         double post_weight   = current_weight;
 
-        if (candidate_signal == OrderSignal::Buy)
+        if (candidate_signal == OrderSignal::Close)
+        {
+            post_notional = 0.0;
+            post_weight   = 0.0;
+        }
+        else if (candidate_signal == OrderSignal::Buy)
         {
             if (portfolio.position_shares > 0.0 && !portfolio.allow_pyramiding)
             {
@@ -240,14 +257,17 @@ public:
         decision.var_passed  = (decision.portfolio_var_95 <= var_limit);
         decision.cvar_passed = (decision.portfolio_cvar_95 <= cvar_limit);
 
-        const double max_alloc_var          = (decision.unit_var_95 > 1e-12) ? (var_limit / decision.unit_var_95) : 1.0;
-        const double max_alloc_cvar         = (decision.unit_cvar_95 > 1e-12) ? (cvar_limit / decision.unit_cvar_95) : 1.0;
-        decision.max_allowed_allocation_pct = std::clamp(std::min({alloc, max_alloc_var, max_alloc_cvar}), 0.0, 1.0);
-
-        if (has_account_equity)
+        if (effective_side != PositionSide::Flat)
         {
-            const double dir_sign       = (effective_side == PositionSide::Short) ? -1.0 : ((effective_side == PositionSide::Long) ? 1.0 : 0.0);
-            decision.recommended_shares = dir_sign * std::floor((portfolio.equity * decision.max_allowed_allocation_pct) / price);
+            const double max_alloc_var          = (decision.unit_var_95 > 1e-12) ? (var_limit / decision.unit_var_95) : 1.0;
+            const double max_alloc_cvar         = (decision.unit_cvar_95 > 1e-12) ? (cvar_limit / decision.unit_cvar_95) : 1.0;
+            decision.max_allowed_allocation_pct = std::clamp(std::min({alloc, max_alloc_var, max_alloc_cvar}), 0.0, 1.0);
+
+            if (has_account_equity)
+            {
+                const double dir_sign       = (effective_side == PositionSide::Short) ? -1.0 : 1.0;
+                decision.recommended_shares = dir_sign * std::floor((portfolio.equity * decision.max_allowed_allocation_pct) / price);
+            }
         }
 
         // Check whether an existing open position independently breaches its own side limits
@@ -297,6 +317,12 @@ public:
             decision.reason        = "SELL/SHORT PASSED: E[r] (" + std::to_string(forecast.expected_return * 100.0) + "%) < -hurdle, P(r>0) (" +
                               std::to_string(forecast.prob_positive_return * 100.0) + "%), Port VaR(95%)=" + std::to_string(decision.portfolio_var_95 * 100.0) +
                               "%, Port CVaR(95%)=" + std::to_string(decision.portfolio_cvar_95 * 100.0) + "%";
+        }
+        else if (candidate_signal == OrderSignal::Close)
+        {
+            decision.signal = OrderSignal::Close;
+            decision.reason = "CLOSE TO FLAT: Alpha edge decayed (E[r]=" + std::to_string(forecast.expected_return * 100.0) +
+                              "%, P(r>0)=" + std::to_string(forecast.prob_positive_return * 100.0) + "%)";
         }
         else
         {

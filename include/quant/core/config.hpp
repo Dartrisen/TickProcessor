@@ -19,9 +19,16 @@ struct EngineConfig
     double      x_max{0.015};
     std::size_t volatility_window{20};
     double      train_split_ratio{0.70};
+    std::size_t forecast_horizon{3};
+    std::size_t min_hold_bars{1};
+    std::size_t max_hold_bars{0}; // 0 = disabled (let positions run until exit signal or risk limit)
+    bool        recheck_at_open{true};
+    bool        dynamic_sizing{true};
+    double      stop_loss_pct{0.0};
+    double      take_profit_pct{0.0};
 
     // Risk Engine parameters
-    RiskLimits risk_limits{};
+    RiskLimits  risk_limits{};
 
     // Exchange Simulation parameters
     double initial_capital{10000.0};
@@ -88,6 +95,27 @@ public:
             cfg.volatility_window = std::stoull(it->second);
         if (auto it = kv.find("TRAIN_SPLIT_RATIO"); it != kv.end())
             cfg.train_split_ratio = std::stod(it->second);
+        if (auto it = kv.find("MODEL_FORECAST_HORIZON"); it != kv.end())
+            cfg.forecast_horizon = std::stoull(it->second);
+        if (auto it = kv.find("RISK_MIN_HOLD_BARS"); it != kv.end())
+            cfg.min_hold_bars = std::stoull(it->second);
+        if (auto it = kv.find("RISK_MIN_HOLD_BARS"); it != kv.end())
+            cfg.min_hold_bars = std::stoull(it->second);
+        if (auto it = kv.find("RISK_MAX_HOLD_BARS"); it != kv.end())
+            cfg.max_hold_bars = std::stoull(it->second);
+        if (auto it = kv.find("RISK_RECHECK_AT_OPEN"); it != kv.end())
+            cfg.recheck_at_open = (it->second == "1" || it->second == "true" || it->second == "TRUE" || it->second == "yes");
+        if (auto it = kv.find("RISK_DYNAMIC_SIZING"); it != kv.end())
+            cfg.dynamic_sizing = (it->second == "1" || it->second == "true" || it->second == "TRUE" || it->second == "yes");
+        if (auto it = kv.find("RISK_EXIT_EXPECTED_RETURN"); it != kv.end())
+            cfg.risk_limits.exit_expected_return = std::stod(it->second);
+        if (auto it = kv.find("SIM_STOP_LOSS_PCT"); it != kv.end())
+            cfg.stop_loss_pct = std::stod(it->second);
+        if (auto it = kv.find("SIM_TAKE_PROFIT_PCT"); it != kv.end())
+            cfg.take_profit_pct = std::stod(it->second);
+
+        if (cfg.forecast_horizon == 0 || cfg.forecast_horizon > 10)
+            throw std::runtime_error("MODEL_FORECAST_HORIZON must be between 1 and 10.");
 
         if (auto it = kv.find("RISK_MAX_VAR_95"); it != kv.end())
             cfg.risk_limits.max_var_95 = std::stod(it->second);
