@@ -60,12 +60,8 @@ int main()
         }
         catch (const std::exception&)
         {
-            std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing/unreadable. Initializing synthetic market dataset...\n" << QuantConsoleReporter::RESET;
-            for (std::size_t i = 0; i < 500; ++i)
-            {
-                double ret = 0.001 * std::sin(static_cast<double>(i) * 0.1);
-                historical_features.push_back(DerivedFeatures{.log_return = ret, .rolling_volatility = 0.002});
-            }
+            std::cout << QuantConsoleReporter::YELLOW << "[!] CSV missing/unreadable. Please provide a valid market data file.\n" << QuantConsoleReporter::RESET;
+            return 1;
         }
 
         std::cout << "[+] Extracted " << QuantConsoleReporter::BOLD << historical_features.size() << QuantConsoleReporter::RESET
