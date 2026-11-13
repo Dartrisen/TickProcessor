@@ -5,6 +5,7 @@ cc_library(
     hdrs = [
         "include/quant/core/config.hpp",
         "include/quant/core/dispatch_table.hpp",
+        "include/quant/core/engine_dispatcher.hpp",
         "include/quant/session/session_observer.hpp",
         "include/quant/session/trading_session.hpp",
         "include/quant/telemetry/console_reporter.hpp",
@@ -31,6 +32,24 @@ cc_binary(
     deps = [
         ":app_support",
         "@execution_simulator",
+        "@kinetic_model",
+        "@market_simulator",
+    ],
+)
+
+cc_binary(
+    name = "signal_inspector",
+    srcs = ["signal_inspector.cpp"],
+    copts = [
+        "-std=c++20",
+        "-O3",
+        "-march=native",
+    ],
+    data = [
+        "//:quant.env",
+    ],
+    deps = [
+        ":app_support",
         "@kinetic_model",
         "@market_simulator",
     ],
