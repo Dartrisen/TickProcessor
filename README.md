@@ -147,10 +147,10 @@ All simulation parameters are configured in `quant.env`:
 
 ## Component Summary
 
-- **`FlatMatrix<T, Bins>`:** 64-byte aligned inline storage (`alignas(64) std::array<T, Bins * Bins>`) for cache-friendly dense matrix-vector propagation.
-- **`LiveRingBufferFeed<Capacity>`:** Lock-free SPSC circular buffer transporting trivially copyable `Tick` values between the feed producer thread and the session consumer loop.
-- **`HighPerformanceKineticEngine<Bins>`:** Evolves discrete return probability densities across $H$ steps and computes expected return, volatility, confidence intervals, direction-aware VaR/CVaR, and Shannon entropy.
-- **`RiskEngine`:** Evaluates candidate and active positions against portfolio tail-risk limits ($\text{VaR}_{95} \le \text{MaxVaR}$, $\text{CVaR}_{95} \le \text{MaxCVaR}$), entropy ceilings ($H \le \text{RISK\_MAX\_ENTROPY}$), and expected-return hurdles.
+* **`FlatMatrix<T, Bins>`:** 64-byte aligned inline storage (`alignas(64) std::array<T, Bins * Bins>`) for cache-friendly dense matrix-vector propagation.
+* **`LiveRingBufferFeed<Capacity>`:** Lock-free SPSC circular buffer transporting trivially copyable `Tick` values between the feed producer thread and the session consumer loop.
+* **`HighPerformanceKineticEngine<Bins>`:** Evolves discrete return probability densities across $H$ steps and computes expected return, volatility, confidence intervals, direction-aware VaR/CVaR, and Shannon entropy.
+* **`RiskEngine`:** Evaluates candidate and active positions against portfolio tail-risk limits ($\text{VaR}(95\%) \le \text{MaxVaR}$ and $\text{CVaR}(95\%) \le \text{MaxCVaR}$), entropy ceilings ($H \le H_{\max}$ via `RISK_MAX_ENTROPY`), and expected-return hurdles.
 
 ---
 
