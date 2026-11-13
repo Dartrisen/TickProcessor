@@ -1,108 +1,19 @@
 #pragma once
 
-#include "quant/core/types.hpp"
-#include "quant/risk/risk_manager.hpp"
+#include "quant/execution/execution_gateway.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <type_traits>
 #include <vector>
 
-struct FeeStructure
-{
-    double commission_rate{0.0001};
-    double fixed_fee_per_trade{0.0};
-    double slippage_bps{0.0001};
-};
-
-struct ExecutionFill
-{
-    std::string timestamp{};
-    OrderSignal side{OrderSignal::Hold};
-
-    double fill_price{0.0};
-    double shares{0.0};
-    double trade_value{0.0};
-    double fee_paid{0.0};
-
-    // Non-zero when an existing position (or partial slice) was closed.
-    // Includes proportional entry fee and exit fee.
-    double realized_pnl{0.0};
-
-    bool opened_position{false};
-    bool closed_position{false};
-};
-
-struct AccountState
-{
-    double cash{10000.0};
-    double position_shares{0.0};
-    double avg_entry_price{0.0};
-    double entry_fee_paid{0.0};
-
-    double realized_pnl{0.0};
-    double gross_profit{0.0};
-    double gross_loss{0.0}; // Stored as positive magnitude
-    double total_fees_paid{0.0};
-
-    double peak_equity{10000.0};
-    double max_drawdown{0.0};
-
-    std::size_t total_trades{0};
-    std::size_t winning_trades{0};
-    std::size_t losing_trades{0};
-
-    [[nodiscard]] double equity(double current_price) const noexcept
-    {
-        return cash + (position_shares * current_price);
-    }
-
-    [[nodiscard]] double unrealized_pnl(double current_price) const noexcept
-    {
-        if (position_shares > 0.0)
-            return position_shares * (current_price - avg_entry_price) - entry_fee_paid;
-
-        if (position_shares < 0.0)
-        {
-            const double quantity = -position_shares;
-            return quantity * (avg_entry_price - current_price) - entry_fee_paid;
-        }
-
-        return 0.0;
-    }
-
-    [[nodiscard]] double avg_win() const noexcept
-    {
-        return winning_trades > 0 ? (gross_profit / static_cast<double>(winning_trades)) : 0.0;
-    }
-
-    [[nodiscard]] double avg_loss() const noexcept
-    {
-        return losing_trades > 0 ? (gross_loss / static_cast<double>(losing_trades)) : 0.0;
-    }
-
-    [[nodiscard]] double payoff_ratio() const noexcept
-    {
-        const double loss = avg_loss();
-        return loss > 1e-12 ? (avg_win() / loss) : 0.0;
-    }
-
-    [[nodiscard]] double profit_factor() const noexcept
-    {
-        return gross_loss > 1e-12 ? (gross_profit / gross_loss) : 0.0;
-    }
-
-    [[nodiscard]] double expectancy_per_trade() const noexcept
-    {
-        return total_trades > 0 ? (realized_pnl / static_cast<double>(total_trades)) : 0.0;
-    }
-};
-
-class SimulatedExchange
+class SimulatedExchange final : public IExecutionGateway
 {
 public:
-    explicit SimulatedExchange(double initial_capital = 10000.0, FeeStructure fees = {}) : fees_(fees)
+    static constexpr double DefaultOneMinBarsPerYear = 98280.0;
+
+    explicit SimulatedExchange(double initial_capital = 10000.0, FeeStructure fees = {}, double bars_per_year = DefaultOneMinBarsPerYear)
+            : fees_(fees), bars_per_year_(bars_per_year > 0.0 ? bars_per_year : DefaultOneMinBarsPerYear)
     {
         account_.cash        = initial_capital;
         account_.peak_equity = initial_capital;
@@ -110,8 +21,7 @@ public:
 
     // Buy targets long exposure (+allocation_pct), Sell targets short exposure (-allocation_pct),
     // and Close flattens any open position to 0.
-    // Every individual fill is stored in fills_history_. The returned fill is the final action.
-    ExecutionFill execute_order(OrderSignal signal, std::string timestamp, double current_price, double allocation_pct = 0.95)
+    ExecutionFill execute_order(OrderSignal signal, FixedTimestamp timestamp, double current_price, double allocation_pct = 0.95) override
     {
         if (signal == OrderSignal::Hold || current_price <= 0.0)
             return {};
@@ -126,7 +36,7 @@ public:
 
     // Rebalances portfolio exposure to a signed equity fraction in [-1.0, +1.0].
     // Supports opening from flat, flattening to 0, side reversals, scaling up, and partial trims.
-    ExecutionFill rebalance_to_target(double target_signed_pct, std::string timestamp, double current_price)
+    ExecutionFill rebalance_to_target(double target_signed_pct, FixedTimestamp timestamp, double current_price)
     {
         ExecutionFill result{};
         if (current_price <= 0.0)
@@ -195,21 +105,9 @@ public:
 
             account_.entry_fee_paid -= fee_share;
             account_.total_fees_paid += fee;
-            account_.realized_pnl += net_pnl;
             account_.cash += was_long ? (trade_value - fee) : -(trade_value + fee);
             account_.position_shares = desired_shares;
-            account_.total_trades++;
-
-            if (net_pnl > 0.0)
-            {
-                account_.winning_trades++;
-                account_.gross_profit += net_pnl;
-            }
-            else if (net_pnl < 0.0)
-            {
-                account_.losing_trades++;
-                account_.gross_loss += std::abs(net_pnl);
-            }
+            record_closed_trade(net_pnl);
 
             result.timestamp       = timestamp;
             result.side            = buying ? OrderSignal::Buy : OrderSignal::Sell;
@@ -225,7 +123,7 @@ public:
         return result;
     }
 
-    ExecutionFill close_position(std::string timestamp, double current_price)
+    ExecutionFill close_position(FixedTimestamp timestamp, double current_price) override
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;
@@ -236,48 +134,28 @@ public:
         const bool   closing_long = account_.position_shares > 0.0;
         const double quantity     = std::abs(account_.position_shares);
 
-        // Long exits sell at bid-like price. Short exits buy at ask-like price.
-        const double fill_price = closing_long ? current_price * (1.0 - fees_.slippage_bps) : current_price * (1.0 + fees_.slippage_bps);
-
+        const double fill_price  = closing_long ? current_price * (1.0 - fees_.slippage_bps) : current_price * (1.0 + fees_.slippage_bps);
         const double trade_value = quantity * fill_price;
         const double exit_fee    = (trade_value * fees_.commission_rate) + fees_.fixed_fee_per_trade;
-
-        const double gross_pnl = closing_long ? quantity * (fill_price - account_.avg_entry_price) : quantity * (account_.avg_entry_price - fill_price);
-
-        const double net_pnl = gross_pnl - account_.entry_fee_paid - exit_fee;
+        const double gross_pnl   = closing_long ? quantity * (fill_price - account_.avg_entry_price) : quantity * (account_.avg_entry_price - fill_price);
+        const double net_pnl     = gross_pnl - account_.entry_fee_paid - exit_fee;
 
         if (closing_long)
         {
-            // Sell long inventory.
             account_.cash += trade_value - exit_fee;
             fill.side = OrderSignal::Sell;
         }
         else
         {
-            // Buy back borrowed shares.
             account_.cash -= trade_value + exit_fee;
             fill.side = OrderSignal::Buy;
         }
 
-        account_.realized_pnl += net_pnl;
         account_.total_fees_paid += exit_fee;
-
         account_.position_shares = 0.0;
         account_.avg_entry_price = 0.0;
         account_.entry_fee_paid  = 0.0;
-
-        account_.total_trades++;
-
-        if (net_pnl > 0.0)
-        {
-            account_.winning_trades++;
-            account_.gross_profit += net_pnl;
-        }
-        else if (net_pnl < 0.0)
-        {
-            account_.losing_trades++;
-            account_.gross_loss += std::abs(net_pnl);
-        }
+        record_closed_trade(net_pnl);
 
         fill.fill_price      = fill_price;
         fill.shares          = quantity;
@@ -290,77 +168,81 @@ public:
         return fill;
     }
 
-    void update_tick(double current_price)
+    ExecutionFill on_bar_update(const Tick& bar, double stop_loss_pct = 0.0, double take_profit_pct = 0.0) override
+    {
+        ExecutionFill bracket_fill{};
+
+        if (account_.position_shares != 0.0)
+        {
+            const bool   is_long   = account_.position_shares > 0.0;
+            const double entry_px  = account_.avg_entry_price;
+            const double stop_px   = is_long ? entry_px * (1.0 - stop_loss_pct) : entry_px * (1.0 + stop_loss_pct);
+            const double target_px = is_long ? entry_px * (1.0 + take_profit_pct) : entry_px * (1.0 - take_profit_pct);
+
+            if (stop_loss_pct > 0.0 && ((is_long && bar.low <= stop_px) || (!is_long && bar.high >= stop_px)))
+            {
+                const double fill_px = is_long ? std::min(bar.open, stop_px) : std::max(bar.open, stop_px);
+                bracket_fill         = close_position(bar.datetime, fill_px);
+            }
+            else if (take_profit_pct > 0.0 && ((is_long && bar.high >= target_px) || (!is_long && bar.low <= target_px)))
+            {
+                const double fill_px = is_long ? std::max(bar.open, target_px) : std::min(bar.open, target_px);
+                bracket_fill         = close_position(bar.datetime, fill_px);
+            }
+        }
+
+        update_tick(bar.close);
+        return bracket_fill;
+    }
+
+    void update_tick(double current_price) noexcept
     {
         if (current_price <= 0.0)
             return;
 
         const double current_equity = account_.equity(current_price);
         update_drawdown(current_equity);
-        equity_curve_.push_back(current_equity);
+
+        if (has_prev_equity_ && prev_equity_ > 0.0)
+        {
+            const double ret = (current_equity / prev_equity_) - 1.0;
+            ++return_count_;
+            const double delta = ret - return_mean_;
+            return_mean_ += delta / static_cast<double>(return_count_);
+            const double delta2 = ret - return_mean_;
+            return_m2_ += delta * delta2;
+        }
+
+        prev_equity_     = current_equity;
+        has_prev_equity_ = true;
     }
 
-    [[nodiscard]] const AccountState& account() const noexcept
+    [[nodiscard]] const AccountState& account() const noexcept override
     {
         return account_;
     }
 
-    [[nodiscard]] const std::vector<ExecutionFill>& fills() const noexcept
+    [[nodiscard]] const std::vector<ExecutionFill>& fills() const noexcept override
     {
         return fills_history_;
     }
 
-    [[nodiscard]] const std::vector<double>& equity_curve() const noexcept
+    [[nodiscard]] double sharpe_ratio(double risk_free_rate_annual = 0.02) const noexcept override
     {
-        return equity_curve_;
-    }
-
-    [[nodiscard]] double sharpe_ratio(double risk_free_rate_annual = 0.02) const noexcept
-    {
-        if (equity_curve_.size() < 3)
+        if (return_count_ < 2)
             return 0.0;
 
-        constexpr double bars_per_year = 98280.0; // one-minute bars
-
-        double      sum_returns = 0.0;
-        std::size_t n           = 0;
-
-        for (std::size_t i = 1; i < equity_curve_.size(); ++i)
-        {
-            if (equity_curve_[i - 1] <= 0.0)
-                continue;
-
-            sum_returns += (equity_curve_[i] / equity_curve_[i - 1]) - 1.0;
-            ++n;
-        }
-
-        if (n < 2)
-            return 0.0;
-
-        const double mean_return = sum_returns / static_cast<double>(n);
-
-        double squared_deviation_sum = 0.0;
-        for (std::size_t i = 1; i < equity_curve_.size(); ++i)
-        {
-            if (equity_curve_[i - 1] <= 0.0)
-                continue;
-
-            const double r = (equity_curve_[i] / equity_curve_[i - 1]) - 1.0;
-            const double d = r - mean_return;
-            squared_deviation_sum += d * d;
-        }
-
-        const double stddev = std::sqrt(squared_deviation_sum / static_cast<double>(n - 1));
-
+        const double variance = return_m2_ / static_cast<double>(return_count_ - 1);
+        const double stddev   = std::sqrt(variance);
         if (stddev <= 1e-12)
             return 0.0;
 
-        const double risk_free_per_bar = risk_free_rate_annual / bars_per_year;
-        return std::sqrt(bars_per_year) * ((mean_return - risk_free_per_bar) / stddev);
+        const double risk_free_per_bar = risk_free_rate_annual / bars_per_year_;
+        return std::sqrt(bars_per_year_) * ((return_mean_ - risk_free_per_bar) / stddev);
     }
 
 private:
-    ExecutionFill open_long(std::string timestamp, double current_price, double allocation_pct)
+    ExecutionFill open_long(FixedTimestamp timestamp, double current_price, double allocation_pct)
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;
@@ -395,7 +277,7 @@ private:
         return fill;
     }
 
-    ExecutionFill open_short(std::string timestamp, double current_price, double allocation_pct)
+    ExecutionFill open_short(FixedTimestamp timestamp, double current_price, double allocation_pct)
     {
         ExecutionFill fill{};
         fill.timestamp = timestamp;
@@ -427,6 +309,23 @@ private:
         return fill;
     }
 
+    void record_closed_trade(double net_pnl) noexcept
+    {
+        account_.realized_pnl += net_pnl;
+        account_.total_trades++;
+
+        if (net_pnl > 0.0)
+        {
+            account_.winning_trades++;
+            account_.gross_profit += net_pnl;
+        }
+        else if (net_pnl < 0.0)
+        {
+            account_.losing_trades++;
+            account_.gross_loss += std::abs(net_pnl);
+        }
+    }
+
     void update_drawdown(double current_equity) noexcept
     {
         if (current_equity > account_.peak_equity)
@@ -439,13 +338,19 @@ private:
             return;
 
         const double drawdown = (account_.peak_equity - current_equity) / account_.peak_equity;
-
         if (drawdown > account_.max_drawdown)
             account_.max_drawdown = drawdown;
     }
 
     FeeStructure               fees_;
-    AccountState               account_;
-    std::vector<ExecutionFill> fills_history_;
-    std::vector<double>        equity_curve_;
+    double                     bars_per_year_;
+    AccountState               account_{};
+    std::vector<ExecutionFill> fills_history_{};
+
+    // Online Welford return statistics for O(1) Sharpe calculation
+    double      prev_equity_{0.0};
+    bool        has_prev_equity_{false};
+    std::size_t return_count_{0};
+    double      return_mean_{0.0};
+    double      return_m2_{0.0};
 };

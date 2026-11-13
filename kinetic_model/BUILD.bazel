@@ -1,0 +1,8 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "kinetic_model",
+    hdrs = glob(["include/quant/**/*.hpp"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

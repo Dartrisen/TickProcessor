@@ -5,12 +5,12 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 class MarketDataset
@@ -20,21 +20,34 @@ public:
 
     void add(Tick bar)
     {
-        bars_.push_back(std::move(bar));
+        bars_.push_back(bar);
+    }
+
+    void set_source(std::string source)
+    {
+        source_ = std::move(source);
+    }
+
+    [[nodiscard]] std::string_view source() const noexcept
+    {
+        return source_;
     }
 
     [[nodiscard]] std::size_t size() const noexcept
     {
         return bars_.size();
     }
+
     [[nodiscard]] bool empty() const noexcept
     {
         return bars_.empty();
     }
+
     [[nodiscard]] const Tick& operator[](std::size_t i) const
     {
         return bars_.at(i);
     }
+
     [[nodiscard]] std::span<const Tick> bars() const noexcept
     {
         return bars_;
@@ -46,7 +59,8 @@ public:
     }
 
 private:
-    Container bars_;
+    std::string source_{"CSV_DATASET"};
+    Container   bars_;
 };
 
 class CsvReader
@@ -108,17 +122,26 @@ public:
                     return fields[i];
                 };
 
-                Tick bar;
-                bar.datetime = std::string(get(datetime_idx));
-                bar.open     = parse_double(get(open_idx));
-                bar.high     = parse_double(get(high_idx));
-                bar.low      = parse_double(get(low_idx));
-                bar.close    = parse_double(get(close_idx));
-                bar.volume   = parse_volume(get(volume_idx));
-                bar.source   = std::string(get(source_idx));
+                Tick bar{};
+                bar.datetime.assign(trim(get(datetime_idx)));
+                bar.open   = parse_double(get(open_idx));
+                bar.high   = parse_double(get(high_idx));
+                bar.low    = parse_double(get(low_idx));
+                bar.close  = parse_double(get(close_idx));
+                bar.volume = parse_volume(get(volume_idx));
 
                 validate(bar);
-                dataset.add(std::move(bar));
+
+                if (dataset.empty())
+                {
+                    const std::string_view row_source = trim(get(source_idx));
+                    if (!row_source.empty())
+                    {
+                        dataset.set_source(std::string(row_source));
+                    }
+                }
+
+                dataset.add(bar);
             }
             catch (const std::exception& e)
             {

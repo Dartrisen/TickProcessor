@@ -1,0 +1,12 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "market_simulator",
+    hdrs = glob(["include/quant/**/*.hpp"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@kinetic_model",
+        "@lock_free_ring_buffer",
+    ],
+)

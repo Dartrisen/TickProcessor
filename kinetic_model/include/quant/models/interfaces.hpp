@@ -6,13 +6,6 @@
 #include <cstddef>
 #include <span>
 
-enum class PositionSide
-{
-    Flat,
-    Long,
-    Short
-};
-
 struct QuantForecast
 {
     std::size_t horizon_steps{1};
