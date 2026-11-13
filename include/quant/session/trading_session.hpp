@@ -23,7 +23,7 @@ template <std::size_t BINS, std::size_t VOL_WINDOW, template <std::size_t> class
 class KineticTradingSession
 {
 public:
-    KineticTradingSession(const EngineConfig& cfg, IExecutionGateway& broker, ISessionObserver& observer = default_observer(), KernelT<BINS> kernel_builder = {})
+    KineticTradingSession(const EngineConfig& cfg, IExecutionGateway& broker, ISessionObserver& observer = default_observer(), KernelT<BINS> kernel_builder = KernelT<BINS>{})
             : cfg_(cfg), broker_(broker), observer_(observer), engine_(cfg.x_max), calibrator_(cfg.recalibration_bars, std::move(kernel_builder)), risk_engine_(cfg.risk_limits),
               current_dist_(engine_.initial_uniform_distribution())
     {

@@ -21,7 +21,7 @@ class WalkForwardCalibrator
 public:
     static constexpr std::size_t DefaultRecalibrationBars = 390;
 
-    explicit WalkForwardCalibrator(std::size_t recalibration_interval = DefaultRecalibrationBars, KernelT<Bins> builder = {})
+    explicit WalkForwardCalibrator(std::size_t recalibration_interval = DefaultRecalibrationBars, KernelT<Bins> builder = KernelT<Bins>{})
             : recalibration_interval_(recalibration_interval), builder_(std::move(builder))
     {
     }
@@ -44,6 +44,11 @@ public:
             rebuild_and_swap(engine);
             bars_since_recal_ = 0;
         }
+    }
+
+    [[nodiscard]] const FlatMatrix<double, Bins>& active_kernel() const noexcept
+    {
+        return buffers_[write_index_ ^ 1];
     }
 
 private:
