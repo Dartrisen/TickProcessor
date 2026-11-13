@@ -1,176 +1,158 @@
-# High-Performance Kinetic Quant Trading Framework
+# Kinetic Quant Trading Framework
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
 ![Build](https://img.shields.io/badge/Build-Bazel-green.svg)
-![Architecture](https://img.shields.io/badge/Architecture-Dual--Speed_Hot%2FCold-orange.svg)
-![Allocations](https://img.shields.io/badge/Memory-Zero--Heap_Hot_Path-brightgreen.svg)
+![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)
 
-A production-grade, low-latency quantitative market prediction and execution framework written in C++20. The system leverages state-space Fokker-Planck kinetic equations for short-term probability density evolution, featuring strict dual-speed separation between high-frequency execution (hot path) and asynchronous matrix calibration (warm/cold path).
+A modular C++20 quantitative research, signal analysis, and paper-trading simulation framework. The engine discretizes log-returns onto a bounded state grid, evolves forward probability densities using Markov transition kernels ($f_{t+1} = W \cdot f_t$), and gates order execution through a direction-aware pre-trade risk filter.
 
 ---
 
-## 🏛 Architecture Overview
+## Architecture Overview
 
-Traditional trading pipelines often suffer from heap jitter, dynamic memory allocations (`std::vector::resize`, `std::function` callbacks), and CPU cache misses when running complex matrix operations alongside tick ingestion.
-
-This framework enforces a **Dual-Speed Separation Architecture**:
-- **Hot Path (Real-Time Execution):** $O(N^2)$ dense matrix-vector probability density propagation ($f_{t+1} = W \cdot f_t$) executing on stack-allocated, SIMD-aligned structures with zero dynamic heap allocations.
-- **Warm Path (Async Calibration):** Background worker thread that periodically recalibrates dynamic transition kernels ($W_{i \to j}$) and updates the active hot path matrix via release-acquire atomic pointer swaps.
-- **Cold Path (Ingestion Engine):** Historical CSV reader and batch feature extraction.
+To keep the bar-processing loop deterministic and avoid per-tick heap allocations, data ingestion is decoupled from strategy evaluation via a lock-free Single-Producer Single-Consumer (SPSC) ring buffer (`LiveRingBufferFeed<4096>`) transporting trivially copyable `Tick` structs (`FixedTimestamp` + OHLCV fields).
 
 ```
-                      [ LIVE FEEDS / CSV INGESTION ]
-                                    │
-                                    ▼  (Lock-Free SPSC Ring Buffer)
-                   ┌──────────────────────────────────┐
-                   │    Data Layer (Ingestion Engine) │
-                   └────────────────┬─────────────────┘
-                                    │
-                                    ▼  (Zero-Allocation Hot Path)
-                   ┌──────────────────────────────────┐
-                   │   Online Feature Engine (O(1))   │
-                   └────────────────┬─────────────────┘
-                                    │
-               ┌────────────────────┴────────────────────┐
-               ▼                                         ▼
-  ┌──────────────────────────────┐          ┌───────────────────────────┐
-  │   Model Inference (Hot Path) │          │  Calibration Engine       │
-  │   - Step PDF propagation     │          │  (Async Background Thread)│
-  │   - O(N^2) dense matrix-vec  │          │  - Calibrate gamma, sigma │
-  │   - Double-buffered Kernel   │◄─────────┤  - Rebuild W(i->j) Kernel │
-  └────────────┬─────────────────┘  Update  └───────────────────────────┘
-               │                    Kernel
-               ▼
-  ┌──────────────────────────────┐
-  │ Pre-Trade Risk & Signals     │
-  │ - VaR / CVaR / Entropy Filter│
-  │ - Order Sizing & Signal Output│
-  └────────────┬─────────────────┘
-               │
-               ▼
-    [ ORDER EXECUTION / TELEMETRY ]
+                     [ CSV MARKET DATA (Producer jthread) ]
+                                       │
+                                       ▼  (Lock-Free SPSC Ring Buffer)
+                   ┌───────────────────────────────────────┐
+                   │       LiveRingBufferFeed<4096>        │
+                   └───────────────────┬───────────────────┘
+                                       │
+                                       ▼
+                   ┌───────────────────────────────────────┐
+                   │       KineticTradingSession           │
+                   │  1. Bar Open : Gap recheck & fills    │
+                   │  2. Intra-Bar: SL / TP bracket check  │
+                   │  3. Bar Close: Features & forecast    │
+                   └───────────────────┬───────────────────┘
+                                       │
+                  ┌────────────────────┴────────────────────┐
+                  ▼                                         ▼
+  ┌───────────────────────────────┐         ┌───────────────────────────────┐
+  │ HighPerformanceKineticEngine  │         │     WalkForwardCalibrator     │
+  │ - Stack-allocated FlatMatrix  │◄────────┤ - Rolling feature window      │
+  │ - Multi-step PDF rollout      │ Atomic  │ - Double-buffered W(i -> j)   │
+  │ - VaR, CVaR, Shannon entropy  │  Swap   │ - Rebuilds every N bars       │
+  └───────────────┬───────────────┘         └───────────────────────────────┘
+                  │
+                  ▼
+  ┌───────────────────────────────┐
+  │          RiskEngine           │
+  │ - Direction-aware VaR / CVaR  │
+  │ - Max Shannon entropy cap     │
+  │ - Alpha hurdle & sizing       │
+  └───────────────┬───────────────┘
+                  │
+                  ▼
+  ┌───────────────────────────────┐
+  │      IExecutionGateway        │
+  │  (SimulatedExchange + Fees)   │
+  └───────────────────────────────┘
 ```
 
 ---
 
-## Key Architectural Pillars
+## Key Capabilities
 
-### 1. Dual-Speed Double-Buffered Kernel Pipeline
-- **Hot Path:** Evaluates forward probability densities using a contiguous 64-byte aligned `FlatMatrix<double, Bins>`. Matrix multiplications are stack-bound and SIMD-friendly (AVX2/AVX-512).
-- **Warm Path:** Rebuilds transition kernels asynchronously every $K$ ticks or $M$ seconds using empirical histograms or Gaussian parameterizations. Kernel updates are swapped atomically using `std::atomic<const Matrix*>`.
+### 1. Compile-Time Template Dispatch (`EngineDispatcher`)
+Runtime settings in `quant.env` map cleanly to `constexpr`-sized stack structures without virtual dispatch in the hot loop. Supported compile-time configurations:
+- **Transition Kernels (`MODEL_KERNEL`):** `empirical`, `gaussian`, `dirichlet`, `phase_space`
+- **State Grid Bins (`MODEL_BINS`):** `8, 12, 16, 24, 32, 64`
+- **Volatility Windows (`FEATURE_VOLATILITY_WINDOW`):** `10, 14, 20, 30, 50, 60`
 
-### 2. Zero-Allocation Feature & Ring Buffer Pipeline
-- Lock-free **Single-Producer Single-Consumer (SPSC)** circular ring buffer for tick ingestion.
-- Eliminates heap-allocated `std::function` callbacks and unbounded containers in favor of fixed-capacity ring buffers and stack-allocated Welford statistics.
+### 2. Double-Buffered Walk-Forward Calibration
+- `HighPerformanceKineticEngine<Bins>` stores transition kernels in 64-byte aligned contiguous `FlatMatrix<double, Bins>` arrays and reads the active matrix pointer via `std::memory_order_acquire`.
+- `WalkForwardCalibrator<Bins, KernelT>` maintains a trailing window of `DerivedFeatures`, alternates writes between two pre-allocated `FlatMatrix` buffers every `MODEL_RECALIBRATION_BARS` bars, and publishes updates atomically.
 
-### 3. Integrated Pre-Trade Risk Management
-- Real-time pre-trade risk filters evaluating Value-at-Risk (95% VaR), Expected Shortfall (CVaR), and Kinetic Entropy (predictive uncertainty).
-- Automatic trade vetoes on high-uncertainty regime shifts or risk limit breaches.
+### 3. Lookahead-Free Simulation & Execution (`SimulatedExchange`)
+- **Bar-Open Execution:** Signals generated at bar $t$ close are queued and executed at bar $t+1$ open. When `RISK_RECHECK_AT_OPEN=true`, the engine subtracts the overnight/inter-bar gap $\ln(O_{t+1} / C_t)$ from the forecast and re-runs risk checks before filling.
+- **Intra-Bar Brackets:** Evaluates optional protective stop-loss (`SIM_STOP_LOSS_PCT`) and take-profit (`SIM_TAKE_PROFIT_PCT`) levels against bar high/low ranges.
+- **Cost & Metric Accounting:** Models slippage (`SIM_SLIPPAGE_BPS`), percentage commissions (`SIM_COMMISSION_RATE`), flat per-trade fees (`SIM_FIXED_FEE`), long/short reversals, max drawdown, and $O(1)$ online Welford Sharpe ratio estimation.
 
-### 4. Rich Telemetry & ANSI Console Formatting
-- Asynchronous console reporting with full ANSI color coding, dynamic risk-event tracking, and live ASCII state-density visualization.
+### 4. Direction-Aware Pre-Trade Risk Management (`RiskEngine`)
+Every candidate entry, reversal, and open position is evaluated against:
+- **Asymmetric Tail Risk:** Checks 95% VaR and CVaR against the left tail for long exposure and the right tail for short exposure (with optional `RISK_SHORT_MAX_VAR_95` / `RISK_SHORT_MAX_CVAR_95` overrides), scaled by post-trade portfolio exposure.
+- **Uncertainty Ceiling:** Vetoes entries and flattens open positions if forecast Shannon entropy exceeds `RISK_MAX_ENTROPY`.
+- **Alpha & Hold Controls:** Enforces expected return hurdles (`RISK_MIN_EXPECTED_RETURN`), alpha-fade exits (`RISK_EXIT_EXPECTED_RETURN`), directional probability bounds, minimum/maximum hold durations, and dynamic exposure scaling (`RISK_DYNAMIC_SIZING`).
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 .
-├── BUILD.bazel                   # Main binary target configuration
-├── MODULE.bazel                  # Bazel module definitions
-├── quant.cpp                     # Application entry point & pipeline runtime
-└── include/
-    └── quant/
-        ├── BUILD.bazel           # C++ library dependency targets
-        ├── core/                 # Core low-level abstractions & primitives
-        │   ├── matrix.hpp        # 64-byte aligned stack matrix (FlatMatrix)
-        │   ├── ring_buffer.hpp   # Lock-free SPSC circular queue
-        │   └── types.hpp         # POD structures (Tick, DerivedFeatures)
-        ├── data/                 # Ingestion & data loading
-        │   └── csv_reader.hpp    # Historical CSV market batch reader
-        ├── features/             # Incremental feature engineering
-        │   ├── feature_engine.hpp# Hot path online feature processor
-        │   └── online_stats.hpp  # Zero-allocation rolling variance & stats
-        ├── models/               # Kinetic Fokker-Planck transition models
-        │   ├── empirical_kernel.hpp # Empirical & Gaussian kernel algorithms
-        │   ├── interfaces.hpp    # Model interfaces & QuantForecast struct
-        │   └── kinetic_model.hpp # High-performance kinetic evolution engine
-        ├── risk/                 # Pre-trade risk manager
-        │   └── risk_manager.hpp  # VaR, CVaR, & Entropy filter decision maker
-        └── telemetry/            # Diagnostic & visualization outputs
-            └── console_reporter.hpp # ANSI terminal dashboard & ASCII plots
+├── BUILD.bazel                         # Bazel targets for sim_runner & signal_inspector
+├── MODULE.bazel                        # Bazel module dependencies
+├── quant.env                           # Runtime model, risk, and simulation configuration
+├── sim_runner.cpp                      # Paper-trading & backtest simulation executable
+├── signal_inspector.cpp                # Diagnostic signal & distribution inspection tool
+├── include/quant/
+│   ├── core/
+│   │   ├── config.hpp                  # .env parser and parameter validator
+│   │   ├── dispatch_table.hpp          # Supported kernel, bin, and window definitions
+│   │   └── engine_dispatcher.hpp       # Compile-time template dispatcher
+│   ├── session/
+│   │   ├── session_observer.hpp        # Observer interface (ISessionObserver / NullSessionObserver)
+│   │   └── trading_session.hpp         # Bar-lifecycle orchestration (open, intra-bar, close)
+│   └── telemetry/
+│       └── console_reporter.hpp        # ANSI console dashboard, trade log, and ASCII density plots
+├── kinetic_model/include/quant/        # Core math, types, online features, kernels, & calibrator
+├── market_simulator/include/quant/     # CSV reader & lock-free SPSC ring buffer market feed
+└── execution_simulator/include/quant/  # IExecutionGateway interface & SimulatedExchange
 ```
 
 ---
 
-## 🚀 Building & Running
+## Building & Running
 
 ### Prerequisites
-- **C++ Compiler:** GCC 11+, Clang 13+, or MSVC supporting `-std=c++20`
-- **Build System:** [Bazel](https://bazel.build/) 6.0+
+- **Compiler:** GCC 11+, Clang 13+, or MSVC with C++20 support
+- **Build System:** Bazel 6.0+
 
-### Build the Project
-Compile the framework with full SIMD vectorization and release optimizations:
-
+### Build All Targets
 ```bash
-bazel build //:quant -c opt
+bazel build //... -c opt
 ```
 
-### Run the Engine
-Execute the live pipeline binary:
-
+### Run the Paper-Trading Simulation (`sim_runner`)
+Loads `quant.env`, calibrates on the initial `TRAIN_SPLIT_RATIO` slice, replays out-of-sample bars through `SimulatedExchange`, and prints trade fills and P&L statistics:
 ```bash
-bazel run //:quant -c opt
+bazel run //:sim_runner -c opt
+```
+
+### Run the Signal & Risk Inspector (`signal_inspector`)
+Replays out-of-sample bars without an exchange broker to inspect transition matrix weights, signal decisions, risk veto counts, and terminal state-density distributions:
+```bash
+bazel run //:signal_inspector -c opt
 ```
 
 ---
 
-## 📊 Sample Output Telemetry
+## Configuration (`quant.env`)
 
-Upon running, the engine displays historical ingestion metrics, initial dynamic transition matrices, live execution signals with risk filter evaluations, and final state-density distributions:
+All simulation parameters are configured in `quant.env`:
 
-```
-========================================================================================================
-  LIVE SIGNAL ANALYSIS & PRE-TRADE RISK STREAM
-========================================================================================================
-[15:31:00] [SIGNAL: BUY]  Price: $442.1500 | E[r]: +0.0125% | P(r>0): 58.30% | VaR(95): 0.4200%
-  └─► Reason: BUY PASSED: E[r] (+0.0125%) > Hurdle & P(r>0) (58.30%) >= 52.00%
-[15:32:00] [SIGNAL: HOLD] Price: $442.1000 | E[r]: -0.0010% | P(r>0): 49.10% | VaR(95): 0.3800%
-  └─► Reason: HOLD: Alpha expectation neutral (E[r]=-0.0010%)
-[15:33:00] [SIGNAL: HOLD] Price: $441.9000 | E[r]: -0.0150% | P(r>0): 42.10% | VaR(95): 5.2000%
-  └─► Reason: VETO: VaR(95%) 5.2000% exceeds max limit 5.0000%
-
-========================================================================================================
-  PRE-TRADE RISK & EXECUTION TELEMETRY SUMMARY
-========================================================================================================
-  Total Hot Path Ticks Evaluated : 390
-  Buy Signals Executed [BUY]    : 42
-  Sell Signals Executed [SELL]  : 18
-  Hold Decisions [HOLD]         : 330
-  Risk Limits Vetoed Trades     : 5
-========================================================================================================
-```
+| Section | Key Parameters | Purpose |
+| :--- | :--- | :--- |
+| **Ingestion & Calibration** | `DATA_PATH`, `TRAIN_SPLIT_RATIO`, `MODEL_RECALIBRATION_BARS` | Dataset path, in-sample split, and walk-forward rebuild cadence |
+| **Kinetic Model** | `MODEL_KERNEL`, `MODEL_BINS`, `MODEL_X_MAX`, `MODEL_FORECAST_HORIZON`, `FEATURE_VOLATILITY_WINDOW` | Kernel estimator, grid resolution, return bounds, horizon, and vol lookback |
+| **Alpha Hurdles** | `RISK_MIN_EXPECTED_RETURN`, `RISK_EXIT_EXPECTED_RETURN`, `RISK_MIN_BULLISH_PROB`, `RISK_MAX_BEARISH_PROB` | Entry/exit expected return floors and directional probability cutoffs |
+| **Tail Risk & Entropy** | `RISK_MAX_VAR_95`, `RISK_MAX_CVAR_95`, `RISK_SHORT_MAX_*`, `RISK_MAX_ENTROPY` | Exposure-scaled 95% VaR/CVaR caps and maximum forecast uncertainty (bits) |
+| **Execution Lifecycle** | `RISK_MIN_HOLD_BARS`, `RISK_MAX_HOLD_BARS`, `RISK_RECHECK_AT_OPEN`, `RISK_DYNAMIC_SIZING` | Hold constraints, open-gap revalidation, and dynamic position sizing |
+| **Simulated Exchange** | `SIM_INITIAL_CAPITAL`, `SIM_ALLOCATION_PCT`, `SIM_STOP_LOSS_PCT`, `SIM_TAKE_PROFIT_PCT`, `SIM_COMMISSION_RATE`, `SIM_SLIPPAGE_BPS`, `SIM_BARS_PER_YEAR` | Starting capital, allocation, intra-bar brackets, transaction costs, and Sharpe annualization |
 
 ---
 
-## 🔧 Component Overview
+## Component Summary
 
-### `FlatMatrix<T, Bins>`
-Provides aligned inline storage (`alignas(64) std::array<T, Bins * Bins>`) ensuring matrix data fits seamlessly into L1 CPU cache lines without pointer indirection.
-
-### `SPSCRingBuffer<T, Capacity>`
-A single-producer single-consumer queue utilizing cache-line padding (`alignas(64)`) to eliminate false sharing between enqueue and dequeue operations.
-
-### `HighPerformanceKineticEngine<Bins>`
-Performs zero-allocation state vector propagation using matrix multiplication. The active kernel matrix pointer is fetched on each step using `std::memory_order_acquire`.
-
-### `RiskEngine`
-Monitors portfolio parameters and mathematical forecasts. Every candidate trade must pass:
-1. $\text{VaR}_{95} \le \text{MaxVaRThreshold}$
-2. $H(\text{distribution}) \ge \text{MinEntropyFloor}$
-3. Alpha hurdle expectations ($E[r]$ and directional probability bounds).
+- **`FlatMatrix<T, Bins>`:** 64-byte aligned inline storage (`alignas(64) std::array<T, Bins * Bins>`) for cache-friendly dense matrix-vector propagation.
+- **`LiveRingBufferFeed<Capacity>`:** Lock-free SPSC circular buffer transporting trivially copyable `Tick` values between the feed producer thread and the session consumer loop.
+- **`HighPerformanceKineticEngine<Bins>`:** Evolves discrete return probability densities across $H$ steps and computes expected return, volatility, confidence intervals, direction-aware VaR/CVaR, and Shannon entropy.
+- **`RiskEngine`:** Evaluates candidate and active positions against portfolio tail-risk limits ($\text{VaR}_{95} \le \text{MaxVaR}$, $\text{CVaR}_{95} \le \text{MaxCVaR}$), entropy ceilings ($H \le \text{RISK\_MAX\_ENTROPY}$), and expected-return hurdles.
 
 ---
 
-## 📄 License
-This project is open-source software licensed under the MIT License.
+## License
+This project is licensed under the MIT License.
