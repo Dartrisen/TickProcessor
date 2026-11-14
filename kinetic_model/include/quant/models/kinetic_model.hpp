@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
-#include <utility>
 
 template <std::size_t Bins>
 class HighPerformanceKineticEngine
@@ -16,6 +15,8 @@ class HighPerformanceKineticEngine
 public:
     using StateVector = std::array<double, Bins>;
     using Matrix      = FlatMatrix<double, Bins>;
+
+    static constexpr std::size_t MaxHorizon = 10;
 
     explicit HighPerformanceKineticEngine(double x_max) : x_max_(x_max), dx_(2.0 * x_max / Bins) {}
 
@@ -99,22 +100,24 @@ public:
         return analyze_and_predict_horizon(current_price, dist, 1, 0.0);
     }
 
-    // Evaluates cumulative return & dual-tail risk over `horizon_steps` starting from `entry_price`,
-    // conditioned on `realized_entry_gap = ln(entry_price / signal_close_price)` already elapsed in step 1.
+    // Exact H-step cumulative return & dual-tail risk evaluation via Markov Additive Process DP.
+    // `step1_dist` is the marginal state PDF for bar t+1; `realized_entry_gap = ln(O_{t+1} / C_t)`
+    // is subtracted from step 1 so forecasts are conditioned on the actual entry price.
     [[nodiscard]] QuantForecast analyze_and_predict_horizon(double entry_price, const StateVector& step1_dist, std::size_t horizon_steps = 1,
                                                             double realized_entry_gap = 0.0) const noexcept
     {
+        const auto*       W           = active_kernel_.load(std::memory_order_acquire);
+        const std::size_t effective_H = (W != nullptr) ? std::clamp<std::size_t>(horizon_steps, 1, MaxHorizon) : 1;
+
         QuantForecast forecast;
-        forecast.horizon_steps    = std::max<std::size_t>(1, horizon_steps);
+        forecast.horizon_steps    = effective_H;
         forecast.entry_gap_return = realized_entry_gap;
         forecast.current_price    = entry_price;
 
         double total_probability = 0.0;
-        double entropy           = 0.0;
         for (std::size_t i = 0; i < Bins; ++i)
         {
-            const double p = std::max(0.0, step1_dist[i]);
-            total_probability += p;
+            total_probability += std::max(0.0, step1_dist[i]);
         }
         if (total_probability <= 1e-12)
             return forecast;
@@ -123,180 +126,99 @@ public:
         for (std::size_t i = 0; i < Bins; ++i)
         {
             norm_step1[i] = std::max(0.0, step1_dist[i]) / total_probability;
-            if (norm_step1[i] > 1e-12)
-                entropy -= norm_step1[i] * std::log2(norm_step1[i]);
         }
 
-        const auto* W = active_kernel_.load(std::memory_order_acquire);
-        if (forecast.horizon_steps >= 2 && W != nullptr)
+        // Stack-allocated ping-pong DP tables indexed by (cumulative_bin_sum, terminal_state).
+        // Because bin centers are equidistant (-x_max + (i + 0.5)*dx), every H-step path with
+        // index sum K = i_1 + ... + i_H has exact cumulative return:
+        //   R(H, K) = H * (-x_max + 0.5 * dx) + K * dx - realized_entry_gap
+        // which is strictly increasing in K (naturally sorted without std::sort).
+        constexpr std::size_t MaxBinSum = MaxHorizon * (Bins - 1);
+        constexpr std::size_t TableSize = (MaxBinSum + 1) * Bins;
+
+        std::array<double, TableSize> dp_curr{};
+        std::array<double, TableSize> dp_next{};
+
+        // Step s = 1 initialization: K = j, terminal state = j
+        for (std::size_t j = 0; j < Bins; ++j)
         {
-            // Exact 2-step Markov path distribution:
-            // Step 1 residual return (O_{i+1} -> C_{i+1}) + Step 2 return (C_{i+1} -> C_{i+2})
-            struct ReturnAtom
-            {
-                double ret{0.0};
-                double prob{0.0};
-            };
+            dp_curr[j * Bins + j] = norm_step1[j];
+        }
 
-            std::array<ReturnAtom, Bins * Bins> atoms{};
-            std::size_t                         atom_count = 0;
+        // Propagate exact joint (cumulative_sum, state) distribution from step 2 through H
+        for (std::size_t step = 2; step <= effective_H; ++step)
+        {
+            const std::size_t prev_max_k = (step - 1) * (Bins - 1);
+            const std::size_t next_max_k = step * (Bins - 1);
 
-            // If horizon_steps > 2, propagate intermediate state to step (horizon_steps - 1)
-            StateVector prev_state = norm_step1;
-            double      mid_drift  = 0.0;
-            for (std::size_t s = 2; s < forecast.horizon_steps; ++s)
+            std::fill_n(dp_next.begin(), (next_max_k + 1) * Bins, 0.0);
+
+            for (std::size_t k = 0; k <= prev_max_k; ++k)
             {
+                const std::size_t k_offset = k * Bins;
                 for (std::size_t i = 0; i < Bins; ++i)
                 {
-                    mid_drift += prev_state[i] * bin_center(i);
-                }
-                StateVector next_state{};
-                evolve(prev_state, next_state);
-                prev_state = next_state;
-            }
-
-            // Compute conditional marginal of step 1 given step (horizon - 1) for exact 2-step joint paths
-            for (std::size_t i = 0; i < Bins; ++i)
-            {
-                const double p_i = norm_step1[i];
-                if (p_i <= 1e-12)
-                    continue;
-
-                const double r_i = (bin_center(i) - realized_entry_gap) + mid_drift;
-                for (std::size_t j = 0; j < Bins; ++j)
-                {
-                    const double p_ij = p_i * (*W)(i, j);
-                    if (p_ij <= 1e-15)
+                    const double p = dp_curr[k_offset + i];
+                    if (p <= 1e-15)
                         continue;
 
-                    atoms[atom_count++] = ReturnAtom{.ret = r_i + bin_center(j), .prob = p_ij};
+                    for (std::size_t j = 0; j < Bins; ++j)
+                    {
+                        dp_next[(k + j) * Bins + j] += p * (*W)(i, j);
+                    }
                 }
             }
 
-            if (atom_count > 0)
-            {
-                std::sort(atoms.begin(), atoms.begin() + static_cast<std::ptrdiff_t>(atom_count), [](const ReturnAtom& a, const ReturnAtom& b) noexcept { return a.ret < b.ret; });
-
-                double norm_sum                  = 0.0;
-                double mean_log_return           = 0.0;
-                double expected_price_multiplier = 0.0;
-                double prob_positive             = 0.0;
-                double mode_ret                  = atoms[0].ret;
-                double mode_prob                 = -1.0;
-
-                for (std::size_t k = 0; k < atom_count; ++k)
-                {
-                    norm_sum += atoms[k].prob;
-                }
-
-                for (std::size_t k = 0; k < atom_count; ++k)
-                {
-                    const double r = atoms[k].ret;
-                    const double p = atoms[k].prob / norm_sum;
-
-                    mean_log_return += p * r;
-                    expected_price_multiplier += p * std::exp(r);
-                    if (r > 0.0)
-                        prob_positive += p;
-                    if (p > mode_prob)
-                    {
-                        mode_prob = p;
-                        mode_ret  = r;
-                    }
-                }
-
-                double variance = 0.0;
-                for (std::size_t k = 0; k < atom_count; ++k)
-                {
-                    const double p    = atoms[k].prob / norm_sum;
-                    const double diff = atoms[k].ret - mean_log_return;
-                    variance += p * diff * diff;
-                }
-
-                auto lower_quantile = [&](double target_prob) noexcept
-                {
-                    double cum = 0.0;
-                    for (std::size_t k = 0; k < atom_count; ++k)
-                    {
-                        cum += atoms[k].prob / norm_sum;
-                        if (cum >= target_prob)
-                            return atoms[k].ret;
-                    }
-                    return atoms[atom_count - 1].ret;
-                };
-
-                auto upper_quantile = [&](double target_prob) noexcept
-                {
-                    double cum = 0.0;
-                    for (std::size_t k = 0; k < atom_count; ++k)
-                    {
-                        const std::size_t idx = atom_count - 1 - k;
-                        cum += atoms[idx].prob / norm_sum;
-                        if (cum >= target_prob)
-                            return atoms[idx].ret;
-                    }
-                    return atoms[0].ret;
-                };
-
-                constexpr double tail_prob = 0.05;
-                double           rem_lower = tail_prob;
-                double           lower_sum = 0.0;
-                for (std::size_t k = 0; k < atom_count && rem_lower > 1e-12; ++k)
-                {
-                    const double p    = atoms[k].prob / norm_sum;
-                    const double used = std::min(p, rem_lower);
-                    lower_sum += used * atoms[k].ret;
-                    rem_lower -= used;
-                }
-
-                double rem_upper = tail_prob;
-                double upper_sum = 0.0;
-                for (std::size_t k = 0; k < atom_count && rem_upper > 1e-12; ++k)
-                {
-                    const std::size_t idx  = atom_count - 1 - k;
-                    const double      p    = atoms[idx].prob / norm_sum;
-                    const double      used = std::min(p, rem_upper);
-                    upper_sum += used * atoms[idx].ret;
-                    rem_upper -= used;
-                }
-
-                const double q025 = lower_quantile(0.025);
-                const double q05  = lower_quantile(0.05);
-                const double q95  = upper_quantile(0.05);
-                const double q975 = upper_quantile(0.025);
-
-                forecast.expected_return      = mean_log_return;
-                forecast.expected_volatility  = std::sqrt(std::max(0.0, variance));
-                forecast.prob_positive_return = prob_positive;
-                forecast.distribution_entropy = entropy;
-
-                forecast.expected_price    = entry_price * expected_price_multiplier;
-                forecast.mode_price        = entry_price * std::exp(mode_ret);
-                forecast.price_ci_lower_95 = entry_price * std::exp(q025);
-                forecast.price_ci_upper_95 = entry_price * std::exp(q975);
-
-                forecast.long_var_95   = std::max(0.0, -q05);
-                forecast.long_cvar_95  = std::max(0.0, -(lower_sum / tail_prob));
-                forecast.short_var_95  = std::max(0.0, q95);
-                forecast.short_cvar_95 = std::max(0.0, upper_sum / tail_prob);
-
-                forecast.var_95  = forecast.long_var_95;
-                forecast.cvar_95 = forecast.long_cvar_95;
-                return forecast;
-            }
+            const std::size_t active_entries = (next_max_k + 1) * Bins;
+            std::copy_n(dp_next.begin(), active_entries, dp_curr.begin());
         }
 
-        // Single-step evaluation (shifted by realized_entry_gap = ln(O_{i+1} / C_i))
+        // Marginalize out terminal state j to obtain sorted cumulative return distribution,
+        // and marginalize out index sum k to obtain terminal state PDF f(t+H) for entropy.
+        const std::size_t num_sums = effective_H * (Bins - 1) + 1;
+        const double      base_ret = static_cast<double>(effective_H) * (-x_max_ + 0.5 * dx_) - realized_entry_gap;
+
+        std::array<double, MaxBinSum + 1> sum_probs{};
+        StateVector                       terminal_pdf{};
+        double                            norm_sum = 0.0;
+
+        for (std::size_t k = 0; k < num_sums; ++k)
+        {
+            const std::size_t k_offset = k * Bins;
+            double            p_k      = 0.0;
+            for (std::size_t j = 0; j < Bins; ++j)
+            {
+                const double p_kj = dp_curr[k_offset + j];
+                p_k += p_kj;
+                terminal_pdf[j] += p_kj;
+            }
+            sum_probs[k] = p_k;
+            norm_sum += p_k;
+        }
+
+        if (norm_sum <= 1e-12)
+            return forecast;
+
+        double terminal_entropy = 0.0;
+        for (std::size_t j = 0; j < Bins; ++j)
+        {
+            const double p_state = terminal_pdf[j] / norm_sum;
+            if (p_state > 1e-12)
+                terminal_entropy -= p_state * std::log2(p_state);
+        }
+
+        auto return_at = [&](std::size_t k) noexcept -> double { return base_ret + static_cast<double>(k) * dx_; };
+
         double      mean_log_return           = 0.0;
         double      expected_price_multiplier = 0.0;
         double      prob_positive             = 0.0;
-        std::size_t mode_index                = 0;
+        std::size_t mode_k                    = 0;
         double      mode_prob                 = -1.0;
 
-        for (std::size_t i = 0; i < Bins; ++i)
+        for (std::size_t k = 0; k < num_sums; ++k)
         {
-            const double r = bin_center(i) - realized_entry_gap;
-            const double p = norm_step1[i];
+            const double p = sum_probs[k] / norm_sum;
+            const double r = return_at(k);
 
             mean_log_return += p * r;
             expected_price_multiplier += p * std::exp(r);
@@ -306,90 +228,87 @@ public:
 
             if (p > mode_prob)
             {
-                mode_prob  = p;
-                mode_index = i;
+                mode_prob = p;
+                mode_k    = k;
             }
         }
 
         double variance = 0.0;
-        for (std::size_t i = 0; i < Bins; ++i)
+        for (std::size_t k = 0; k < num_sums; ++k)
         {
-            const double p    = norm_step1[i];
-            const double diff = (bin_center(i) - realized_entry_gap) - mean_log_return;
+            const double p    = sum_probs[k] / norm_sum;
+            const double diff = return_at(k) - mean_log_return;
             variance += p * diff * diff;
         }
 
-        auto lower_return_quantile = [&](double tail_prob) noexcept
+        auto lower_quantile = [&](double target_prob) noexcept -> double
         {
             double cumulative = 0.0;
-            for (std::size_t i = 0; i < Bins; ++i)
+            for (std::size_t k = 0; k < num_sums; ++k)
             {
-                cumulative += norm_step1[i];
-                if (cumulative >= tail_prob)
-                    return bin_center(i) - realized_entry_gap;
+                cumulative += sum_probs[k] / norm_sum;
+                if (cumulative >= target_prob)
+                    return return_at(k);
             }
-            return bin_center(Bins - 1) - realized_entry_gap;
+            return return_at(num_sums - 1);
         };
 
-        auto upper_return_quantile = [&](double tail_prob) noexcept
+        auto upper_quantile = [&](double target_prob) noexcept -> double
         {
             double cumulative = 0.0;
-            for (std::size_t k = 0; k < Bins; ++k)
+            for (std::size_t offset = 0; offset < num_sums; ++offset)
             {
-                const std::size_t idx = Bins - 1 - k;
-                cumulative += norm_step1[idx];
-                if (cumulative >= tail_prob)
-                    return bin_center(idx) - realized_entry_gap;
+                const std::size_t k = num_sums - 1 - offset;
+                cumulative += sum_probs[k] / norm_sum;
+                if (cumulative >= target_prob)
+                    return return_at(k);
             }
-            return bin_center(0) - realized_entry_gap;
+            return return_at(0);
         };
 
-        constexpr double tail_probability      = 0.05;
-        double           lower_remaining_prob  = tail_probability;
-        double           lower_tail_return_sum = 0.0;
+        constexpr double tail_probability = 0.05;
+        double           rem_lower        = tail_probability;
+        double           lower_tail_sum   = 0.0;
 
-        for (std::size_t i = 0; i < Bins && lower_remaining_prob > 1e-12; ++i)
+        for (std::size_t k = 0; k < num_sums && rem_lower > 1e-12; ++k)
         {
-            const double p         = norm_step1[i];
-            const double used_prob = std::min(p, lower_remaining_prob);
-
-            lower_tail_return_sum += used_prob * (bin_center(i) - realized_entry_gap);
-            lower_remaining_prob -= used_prob;
+            const double p    = sum_probs[k] / norm_sum;
+            const double used = std::min(p, rem_lower);
+            lower_tail_sum += used * return_at(k);
+            rem_lower -= used;
         }
 
-        double upper_remaining_prob  = tail_probability;
-        double upper_tail_return_sum = 0.0;
+        double rem_upper      = tail_probability;
+        double upper_tail_sum = 0.0;
 
-        for (std::size_t k = 0; k < Bins && upper_remaining_prob > 1e-12; ++k)
+        for (std::size_t offset = 0; offset < num_sums && rem_upper > 1e-12; ++offset)
         {
-            const std::size_t idx       = Bins - 1 - k;
-            const double      p         = norm_step1[idx];
-            const double      used_prob = std::min(p, upper_remaining_prob);
-
-            upper_tail_return_sum += used_prob * (bin_center(idx) - realized_entry_gap);
-            upper_remaining_prob -= used_prob;
+            const std::size_t k    = num_sums - 1 - offset;
+            const double      p    = sum_probs[k] / norm_sum;
+            const double      used = std::min(p, rem_upper);
+            upper_tail_sum += used * return_at(k);
+            rem_upper -= used;
         }
 
-        const double q025 = lower_return_quantile(0.025);
-        const double q05  = lower_return_quantile(0.05);
-        const double q95  = upper_return_quantile(0.05);
-        const double q975 = upper_return_quantile(0.025);
+        const double q025 = lower_quantile(0.025);
+        const double q05  = lower_quantile(0.05);
+        const double q95  = upper_quantile(0.05);
+        const double q975 = upper_quantile(0.025);
 
         forecast.expected_return      = mean_log_return;
         forecast.expected_volatility  = std::sqrt(std::max(0.0, variance));
         forecast.prob_positive_return = prob_positive;
-        forecast.distribution_entropy = entropy;
+        forecast.distribution_entropy = terminal_entropy;
 
-        forecast.expected_price = entry_price * expected_price_multiplier;
-        forecast.mode_price     = entry_price * std::exp(bin_center(mode_index) - realized_entry_gap);
-
+        forecast.expected_price    = entry_price * expected_price_multiplier;
+        forecast.mode_price        = entry_price * std::exp(return_at(mode_k));
         forecast.price_ci_lower_95 = entry_price * std::exp(q025);
         forecast.price_ci_upper_95 = entry_price * std::exp(q975);
 
         forecast.long_var_95   = std::max(0.0, -q05);
-        forecast.long_cvar_95  = std::max(0.0, -(lower_tail_return_sum / tail_probability));
+        forecast.long_cvar_95  = std::max(0.0, -(lower_tail_sum / tail_probability));
         forecast.short_var_95  = std::max(0.0, q95);
-        forecast.short_cvar_95 = std::max(0.0, upper_tail_return_sum / tail_probability);
+        forecast.short_cvar_95 = std::max(0.0, upper_tail_sum / tail_probability);
 
         forecast.var_95  = forecast.long_var_95;
         forecast.cvar_95 = forecast.long_cvar_95;
